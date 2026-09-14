@@ -1,0 +1,34 @@
+# ── 机密：绝对不要进公开仓库 ─────────────────────────────
+# .env 是阿里云 DashScope API Key，与 VPN 无关
+.env
+# 本机工作日志 / 自动化记录，含个人上下文
+.workbuddy/
+
+# ── 运行时产物（每次启动重新生成）────────────────────────
+config.json
+selected_node.txt
+xray.pid
+nodes.json
+.start_cli.lock/
+
+# ── 日志 ─────────────────────────────────────────────────
+*.log
+health.log*
+xray.log*
+
+# ── 备份与历史副本 ───────────────────────────────────────
+*.bak
+*.bak.*
+*.bac
+*.bak_hk_remove
+start_cli_0908.sh
+
+# ── Python 缓存 ──────────────────────────────────────────
+__pycache__/
+*.pyc
+
+# ── 二进制与地理数据（体积大，获取方式见 README）─────────
+xray
+Xray-linux-64.zip
+geoip.dat
+geosite.dat

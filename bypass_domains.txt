@@ -1,0 +1,85 @@
+# macOS 系统代理「绕过」清单（每行一条，# 开头为注释）
+# 由 start_cli.sh 读取并写入 networksetup -setproxybypassdomains
+# 注意：这里只影响走「系统代理」的应用（Safari/Chrome/Electron 等）。
+#       命令行工具、不走系统代理的 App，靠 xray 的 geosite:cn / geoip:cn 路由规则兜底。
+
+# ── 本地与内网 ──
+127.0.0.1
+localhost
+*.local
+192.168.0.0/16
+10.0.0.0/8
+172.16.0.0/12
+169.254.0.0/16
+
+# ── 中国大陆顶级域名 ──
+*.cn
+*.com.cn
+*.net.cn
+*.org.cn
+*.gov.cn
+*.edu.cn
+*.ac.cn
+
+# ── 常见 .com 国内站与服务 ──
+*.baidu.com
+*.bdstatic.com
+*.qq.com
+*.tencent.com
+*.myqcloud.com
+*.qcloud.com
+*.weixin.com
+*.taobao.com
+*.tmall.com
+*.alicdn.com
+*.alibaba.com
+*.alipay.com
+*.aliyun.com
+*.alibabacloud.com
+*.dingtalk.com
+*.jd.com
+*.360buyimg.com
+*.bilibili.com
+*.hdslb.com
+*.163.com
+*.126.net
+*.netease.com
+*.weibo.com
+*.sohu.com
+*.zhihu.com
+*.douban.com
+*.csdn.net
+*.gitee.com
+*.gitcode.com
+*.atomgit.com
+*.cnblogs.com
+*.jianshu.com
+*.bytedance.com
+*.volces.com
+*.byteimg.com
+*.toutiao.com
+*.douyin.com
+*.kuaishou.com
+*.meituan.com
+*.dianping.com
+*.ctrip.com
+*.pinduoduo.com
+*.ximalaya.com
+*.huawei.com
+*.xiaomi.com
+*.mi.com
+*.oppo.com
+*.vivo.com
+*.lenovo.com
+*.dji.com
+*.qiniu.com
+*.coding.net
+*.npmmirror.com
+*.cnpmjs.org
+*.cnki.net
+*.chaoxing.com
+*.tsinghua.edu.cn
+*.pku.edu.cn
+*.buaa.edu.cn
+*.ucas.ac.cn
+*.cas.cn

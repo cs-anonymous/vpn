@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.a.vpn-health</string>
+
+  <!--
+    用 auto-heal 而不是 health-probe：
+      health-probe 只采样记账，exit 0，永远不会把代理拉起来；
+      auto-heal    先采样，UP 就退出，DOWN 就顺势走完整选节点 + 重启流程。
+    这正是「自动重连」的入口。
+  -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/a./vpn/start_cli.sh</string>
+    <string>auto-heal</string>
+  </array>
+
+  <!-- launchd 的 PATH 极简，必须显式补上 python3 / curl 所在目录 -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/Users/a./.workbuddy/binaries/python/versions/3.13.12/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>HOME</key>
+    <string>/Users/a.</string>
+    <key>PYTHON_BIN</key>
+    <string>python3</string>
+  </dict>
+
+  <!-- 每 60 秒检查一次 -->
+  <key>StartInterval</key>
+  <integer>60</integer>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <!--
+    关键：脚本用 nohup 在后台拉起 xray。不加这一条，launchd 会在本次任务
+    结束时把整个进程组一起回收，xray 立刻被杀死 —— 表现为「每分钟起来又挂」。
+  -->
+  <key>AbandonProcessGroup</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/a./vpn/health.launchd.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/a./vpn/health.launchd.log</string>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>
