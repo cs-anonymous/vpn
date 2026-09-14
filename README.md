@@ -61,7 +61,7 @@ VPN_HOME=/path/to/vpn bash start_cli.sh doctor
 | 文件 | 内容 | 大小 |
 | --- | --- | --- |
 | `logs/vpn.log` | **操作流水**：启动 / 换节点 / 自愈 / 代理开关。`start_cli.sh`、`stop_cli.sh` 共用一份 | 每次动作几行 |
-| `logs/health.log` | 每分钟一条 `<ISO8601> <1\|0> <link.txt 行号> [<明细>]` 采样 | 自动修剪到 20000 行 |
+| `logs/health.log` | 每次运行 1~2 条 `<ISO8601> <1\|0> <link.txt 行号> [<明细>]` 采样（换节点成功会为新节点补 1 条） | 自动修剪到 20000 行 |
 | `logs/cron.log` | cron 包装器运行日志，UP 每分钟一行、异常展开明细 | 512KB 后轮换为 `.1` |
 | `logs/xray.log` | xray 进程自身的 stdout/stderr，每次启动覆盖 | 小 |
 
@@ -202,6 +202,9 @@ ratio = (窗口内 UP 数 + prior * k) / (窗口内样本数 + k)
 
 `auto-heal` 里 `NODE_STABLE_ROUNDS=2`、采样侧 `HEALTH_CONFIRM_ROUNDS=2`，两处判定方向一致（都趋严），不再互相打架。
 
+换来之后还要**记账**：换成功了却不落盘，`health.log` 里就只剩旧节点那条失败，
+新节点永远是「未探测」。见 [一次运行写 1~2 条](#一次运行写-12-条)。
+
 **换节点全军覆没时回滚**：若两轮候选全部失败，脚本退回换节点之前的那个节点
 （`PREV_NODE`），宁可「将就用旧节点」也不彻底断网，下一分钟再试。日志记为「回滚到原节点 N」。
 
@@ -275,6 +278,32 @@ cron 不继承 shell 环境，要改这些值就写进 crontab 的环境行（�
 `0` 的含义是**连续 `HEALTH_CONFIRM_ROUNDS`（默认 2）轮全部失败 = 确认不可用**，
 不是「这一秒抖了一下」。任一轮通过即记 `1`。
 
+### 一次运行写 1~2 条
+
+| 场景 | 记几条 | 内容 |
+| --- | --- | --- |
+| 采样通过（或走了「复用存活代理」） | **1** | `<1> <当前节点>` |
+| 采样失败 → 换节点成功 | **2** | `<0> <旧节点>` + `<1> <新节点>` |
+
+第 1 条落在主流程最前面（`auto-heal` 则在自己的分支里），记的是**这一分钟开始时
+旧节点还能不能用** —— 放在重启动作之前，脚本就算随后被杀，样本也已经落盘。
+
+第 2 条由 `log_health_after_switch()` 在 `print_success()` 末尾补记。**换成功了不落盘，
+新节点就永远是「未探测」**：`node_stats.py` 只能拿先验 0.85 给它打分，一个「它其实能用」
+的证据都攒不下来，下一轮排序它还得吃亏。补记的两种情况：
+
+1. 最终节点 ≠ 已记账节点 —— 正常换节点成功；
+2. 最终节点 = 已记账节点，但已记账的值是 `0` —— 两轮候选全军覆没后回滚，
+   复用原节点并且这次真的通了。
+
+已经有一条 `1` 的节点不重复记 —— 同一分钟给同一节点刷两条相同样本，等于给它双倍
+权重把 UP ratio 灌水。
+
+配套的一条约束：`try_node` 失败时会**还原 `selected_node.txt`**。
+`gen_xray_config.py` 把「写配置」和「写 selected」做成了一件事，但配置写出来不等于
+节点可用；不还原的话它会停在最后一个失败节点上，而下一次采样（此刻端口是关的，
+必然记 0）就白送那个节点进冷却。`logs/vpn.log` 里记为「切换后补记 node=N ...」。
+
 ```bash
 awk '{print $2}' logs/health.log     # 原始 1/0 序列
 awk '$2=="0"{print $4}' logs/health.log | sort | uniq -c | sort -rn   # 失败都卡在哪
@@ -339,7 +368,7 @@ config.json             运行时生成，每次启动覆盖
 selected_node.txt       运行时生成，记录当前节点（node_id = link.txt 行号）
 logs/                   全部日志目录（整目录被 gitignore）
 logs/vpn.log            操作流水：启动 / 换节点 / 自愈 / 代理开关
-logs/health.log         每分钟 1/0 采样，append-only，自动修剪
+logs/health.log         每次运行 1~2 条 1/0 采样，append-only，自动修剪
 logs/cron.log           cron 运行日志，静默 UP 每分钟一行（轮换为 .1）
 logs/xray.log           xray 进程自身的输出，每次启动覆盖
 proxy.env               Linux 下生成，source 后当前 shell 可用代理

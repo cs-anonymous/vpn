@@ -430,6 +430,11 @@ link_total_lines() {
     || echo 0
 }
 
+# 本次运行已经为哪个节点记过账、记的是什么值。
+# log_health_after_switch 靠它判断要不要补样本，避免同一分钟给同一节点记两条。
+HEALTH_LOGGED_NODE=""
+HEALTH_LOGGED_OK=""
+
 log_health() {
   # 参数 1：1/0   参数 2：节点行号（可选，默认 "-"）   参数 3：失败明细（可选）
   local ok="${1:-0}" node="${2:-$(current_node_id)}" diag="${3:-}"
@@ -438,6 +443,8 @@ log_health() {
   else
     printf '%s %s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$ok" "$node" >> "$HEALTH_LOG"
   fi
+  HEALTH_LOGGED_NODE="$node"
+  HEALTH_LOGGED_OK="$ok"
 }
 
 # ── 采样状态（直接写全局，避免 $( ) 子 shell 把明细丢掉）────────────
@@ -472,6 +479,32 @@ health_check_state() {
 health_probe_once() {
   health_check_state
   log_health "$HEALTH_OK" "$(current_node_id)" "$HEALTH_DIAG"
+}
+
+# 换节点成功后补记一条样本 —— 一次运行写 1~2 条 health 里的第 2 条。
+#
+# 为什么需要它：主流程开头（或 auto-heal 的 case 里）已经记过一条，那是
+# 「这一分钟开始时，旧节点是否可用」。如果它是 0，脚本会去换节点；换成功了
+# 却不落盘，health.log 里就只留着旧节点的失败，新节点永远是「未探测」——
+# node_stats.py 只能拿 prior(0.85) 给它打分，一个「它其实能用」的证据都攒不下，
+# 下一轮排序它还得吃亏。
+#
+# 两种情况补记：
+#   1. 最终节点 ≠ 已记账节点 —— 正常换节点成功；
+#   2. 最终节点 = 已记账节点，但已记账的值是 0 —— 全军覆没后回滚，
+#      复用原节点并且这次真的通了。
+# 已经有一条 1 的节点直接跳过：同一分钟给同一节点刷两条相同样本会把 UP ratio
+# 灌水（cron 每分钟一次，多出来的那条等于双倍权重）。
+log_health_after_switch() {
+  local node
+  node="$(current_node_id)"
+  [[ "$node" =~ ^[0-9]+$ ]] || return 0
+  if [[ "$node" == "$HEALTH_LOGGED_NODE" && "$HEALTH_LOGGED_OK" == "1" ]]; then
+    return 0
+  fi
+  health_check_state
+  log_health "$HEALTH_OK" "$node" "$HEALTH_DIAG"
+  vlog_file "health: 切换后补记 node=${node} ${HEALTH_OK} [${HEALTH_DIAG}]"
 }
 
 health_watch() {
@@ -847,6 +880,8 @@ case "${1:-}" in
 logs/health.log 格式: <ISO8601> <1|0> <link.txt行号> [<失败明细>]
       明细形如 google=000 或 google=204,youtube=403，用于定位抖动卡在哪一段；
       0 的含义是「连续 \${HEALTH_CONFIRM_ROUNDS} 轮全部失败」= 确认不可用。
+      一次运行写 1~2 条：先记「开始时当前节点是否可用」；若它是 0，
+      脚本换了节点并启动成功，会为新节点再补 1 条。
 策略参数可用环境变量覆盖：RANK_WINDOW=86400 NODE_COOLDOWN=3600 DEFAULT_NODE_RATIO=0.85
                          NODE_STABLE_ROUNDS=2 MAX_HEAL_SECONDS=180
                          HEALTH_CONFIRM_ROUNDS=2 HEALTH_INTERVAL=60
@@ -954,6 +989,16 @@ rank_candidates() {
     --format lines "$@" 2>/dev/null
 }
 
+# 还原 selected_node.txt。参数 1 是调用前的快照内容；
+# 空字符串表示「原本就不存在」，那就删掉而不是留一个空文件。
+restore_selected_file() {
+  if [[ -n "$1" ]]; then
+    printf '%s\n' "$1" > "$SELECTED_FILE"
+  else
+    rm -f "$SELECTED_FILE"
+  fi
+}
+
 # 起 xray 并验证。成功 0，失败 1。
 # 提到 MAX_HEAL_SECONDS 就立刻放弃，把这一分钟的时间留给下一次 cron 触发。
 try_node() {
@@ -964,14 +1009,24 @@ try_node() {
     return 1
   fi
 
+  # gen_xray_config.py 把「写配置」和「写 selected_node.txt」做成一件事，
+  # 但配置写出来不等于节点可用。失败必须还原 selected_node.txt：
+  # 否则它会停在最后一个失败节点上，而下一次采样（此刻端口是关的，必然记 0）
+  # 就把这个 0 记到一个根本没在服务的节点头上，白送它进冷却。
+  local _sel_backup=""
+  [[ -f "$SELECTED_FILE" ]] && _sel_backup="$(cat "$SELECTED_FILE" 2>/dev/null)"
+
   # 按 link.txt 行号寻址（与 health.log 第 3 列同一套编号）
-  "$PYTHON_BIN" "$GEN_SCRIPT" \
+  if ! "$PYTHON_BIN" "$GEN_SCRIPT" \
     --links "$LINK_FILE" \
     --line "$line_no" \
     --http-port "$HTTP_PORT" \
     --socks-port "$SOCKS_PORT" \
     --out "$CONF_FILE" \
-    --selected "$SELECTED_FILE" || return 1
+    --selected "$SELECTED_FILE"; then
+    restore_selected_file "$_sel_backup"
+    return 1
+  fi
 
   # 后台拉起并脱离当前会话，cron 任务结束时 xray 必须活着。
   # macOS 没有 setsid，nohup 两个平台都有。
@@ -983,6 +1038,7 @@ try_node() {
   if ! check_port_listening "$HTTP_PORT"; then
     kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
+    restore_selected_file "$_sel_backup"
     return 1
   fi
 
@@ -991,6 +1047,7 @@ try_node() {
   else
     kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
+    restore_selected_file "$_sel_backup"
     return 1
   fi
 }
@@ -1071,6 +1128,9 @@ print_success() {
   vlog "socks5://127.0.0.1:${SOCKS_PORT}"
   vlog "pid=$(cat "$PID_FILE")"
   vlog "$(current_node_summary)"
+  # 真正启动成功才可能补第 2 条样本 —— 三条成功路径（手工指定 / 自动选 /
+  # 回滚）都汇集在这里；「复用存活代理」那条不经过它，本来也只有 1 条。
+  log_health_after_switch
 }
 
 if [[ -n "${2:-}" ]]; then
