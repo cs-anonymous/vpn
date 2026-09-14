@@ -1,0 +1,16 @@
+# ── 二进制：禁止一切文本转换 ────────────────────────────────────────
+# `binary` = `-text -diff`。这一条是必需的：本仓库有 Windows 同步机，
+# 若在 core.autocrlf=true 的环境里 clone，git 会试图「修正」二进制里的
+# 0x0d/0x0a 字节序列，结果就是 xray 直接损坏、geoip.dat 校验不过。
+# 显式声明比依赖 git 的二进制探测更稳（.dat 有时会被猜成文本）。
+xray                binary
+xray-*              binary
+Xray-*.zip          binary
+geoip.dat           binary
+geosite.dat         binary
+
+# ── 脚本与纯文本：统一 LF ───────────────────────────────────────────
+# 同样为了 Windows：CRLF 会让 cron 报 "/bin/sh^M: bad interpreter"，
+# 而这类报错在记事本里看不出来。强制入库为 LF、检出也为 LF。
+*.sh                text eol=lf
+*.py                text eol=lf

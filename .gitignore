@@ -34,8 +34,7 @@ start_cli_0908.sh
 __pycache__/
 *.pyc
 
-# ── 二进制与地理数据（体积大，获取方式见 README）─────────
-xray
-Xray-linux-64.zip
-geoip.dat
-geosite.dat
+# ── 二进制与地理数据：已入库，clone 后直接用 ─────────────
+# xray / xray-linux-64 / geoip.dat / geosite.dat / Xray-*.zip
+# 故意不忽略。若日后不想让它们进版本控制，在这里加回文件名即可，
+# 但注意 git 不会因为新增 ignore 规则而移除已跟踪的文件，需先 git rm --cached。

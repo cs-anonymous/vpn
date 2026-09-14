@@ -10,6 +10,8 @@ xray 代理的启动 / 节点维护 / 断线自愈工具。**macOS 与 Linux 通
 ## 快速开始
 
 ```bash
+git clone <repo> ~/vpn && cd ~/vpn     # 自带 xray 二进制与 geo 数据，clone 完即可用
+
 # 自动选节点启动（TCP 预筛 + 历史可用率排序 + 冷却过滤）
 bash start_cli.sh
 
@@ -26,6 +28,8 @@ bash start_cli.sh doctor
 # 停止
 bash stop_cli.sh
 ```
+
+无需 `chmod +x`、无需下载二进制。项目目录**必须**是 `~/vpn`（`start_cli.sh` 默认从 `~/vpn/link.txt` 读节点，可用 `LINK_FILE` 覆盖）。
 
 ---
 
@@ -198,16 +202,24 @@ bash start_cli.sh nodes              # 按节点汇总
 
 ---
 
-## 依赖与大文件
+## 二进制与地理数据
 
-仓库**不含**二进制，clone 后需要自己补上（都放在项目目录下）：
+**仓库自带全部运行时依赖，clone 之后不需要下载任何东西，直接就能起。**
 
-| 文件 | 获取方式 |
-| --- | --- |
-| `xray` | `https://github.com/XTLS/Xray-core/releases` → 选对应平台，解压后 `chmod +x`，放成 `xray` |
-| `xray-<os>-<arch>` | 想同时放多个平台的二进制时用这个命名（如 `xray-linux-64`、`xray-macos-arm64-v8a`）。脚本会真的执行 `xray version` 来确认架构匹配，装错的那份会被自动跳过 |
-| `geoip.dat` / `geosite.dat` | 同上 release 包内 |
-| `link.txt` | 你自己的订阅节点列表（每行一个 vmess/ss/trojan/vless 链接） |
+| 文件 | 大小 | 说明 |
+| --- | --- | --- |
+| `xray` | 36 MB | macOS x86_64（Apple Silicon 走 Rosetta 2）。脚本按 `xray-<os>-<arch>` → `xray` 顺序查找，并真的执行一次 `xray version` 验证架构 |
+| `xray-linux-64` | 37 MB | Linux x86_64 静态链接 ELF。命名对应 `linux-64` 后缀，在 Linux 上会被优先选中 |
+| `geoip.dat` / `geosite.dat` | 30 MB | 分流规则数据。`start_cli.sh` 导出 `XRAY_LOCATION_ASSET=$SCRIPT_DIR`，所以不依赖 cwd |
+| `Xray-linux-64.zip` | 21 MB | 上游原始 release 包，`xray-linux-64` 即从中解出。内容与顶层文件一致（geo 数据 sha256 相同），只是留档 |
+| `link.txt` | 22 KB | 节点列表，每行一个 vmess/ss/trojan/vless 链接 |
+
+二进制由 git 以可执行位（mode `100755`）保存，clone 后即可运行，不需要 `chmod +x`。
+`.gitattributes` 把 `xray*` / `*.dat` / `*.zip` 标为 `binary`，避免在 Windows 上被行尾转换损坏。
+
+想要更瘦的仓库：删掉 `Xray-linux-64.zip`（`git rm --cached`）可省 21 MB，代价是 `xray-linux-64` 失去上游留档。
+
+**更新 xray** 时替换对应文件并提交即可。注意 git 每个版本都会留一份历史副本（约 +36 MB/次），频繁更新可考虑改挂 Git LFS。
 
 运行时依赖：**Python 3.9+**（`dict[str, ...]` 泛型注解）、`bash`（已兼容 3.2）、`curl`。
 `xray` 二进制的查找顺序是 `XRAY_BIN_OVERRIDE` 环境变量 → `xray-<os>-<arch>` → `xray`。
@@ -226,6 +238,12 @@ node_probe.py           候选枚举 + TCP 可达性预筛（跨平台的 ping �
 stop_cli.sh             停止代理并关闭系统代理
 proxy_switch.sh         系统代理开关（转发到 start_cli.sh proxy-*）
 bypass_domains.txt      系统代理绕过列表
+link.txt                节点列表（节点 ID = 本文件行号）
+xray                    macOS x86_64 二进制（已在库内）
+xray-linux-64           Linux x86_64 二进制（已在库内）
+geoip.dat geosite.dat   分流规则数据（已在库内）
+Xray-linux-64.zip       上游原始 release 包（留档）
+.gitattributes          二进制保护 + 脚本统一 LF
 config.json             运行时生成，每次启动覆盖
 selected_node.txt       运行时生成，记录当前节点（node_id = link.txt 行号）
 health.log              采样日志，append-only
@@ -237,6 +255,8 @@ proxy.env               Linux 下生成，source 后当前 shell 可用代理
 
 ## 注意
 
-`link.txt`、`config.json`、`selected_node.txt` 含节点凭据。本仓库是公开的，**不要把 `.env`、工作日志或任何 API Key 一起提交**（`.gitignore` 已挡住 `/.env`、`/.workbuddy/`、`*.log`、`crontab.backup.*`、`proxy.env` 和二进制）。
+`link.txt`、`config.json`、`selected_node.txt` 含节点凭据。本仓库是公开的，**不要把 `.env`、工作日志或任何 API Key 一起提交**（`.gitignore` 已挡住 `/.env`、`/.workbuddy/`、`*.log`、`crontab.backup.*`、`proxy.env`）。
+
+`xray`、`xray-linux-64`、`geoip.dat`、`geosite.dat` **是故意入库的**，为的是 clone 后开箱可用；它们来自 XTLS/Xray-core 的公开 release（MIT/Apache-2.0 系），不含任何隐私。新增忽略规则后建议用 `git check-ignore -v <file>` 逐个验证 —— `.gitignore` 里 `#` 只有**行首**才是注释，写在模式行尾会让整条规则静默失效。
 
 代码里也刻意避免把整条 link 打进日志：`current_node_summary()` 只输出 `node=N (proto)`，不会把含 UUID 的链接写进 `cron.log`。
