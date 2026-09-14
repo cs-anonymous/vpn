@@ -15,6 +15,13 @@ nodes.json
 *.log
 health.log*
 xray.log*
+cron.log*
+
+# ── 定时任务产物 ─────────────────────────────────────────
+# vpn-cron.sh 写日志（cron.log），install-cron.sh 备份原 crontab，
+# start_cli.sh 在 Linux 上生成 proxy.env
+crontab.backup.*
+proxy.env
 
 # ── 备份与历史副本 ───────────────────────────────────────
 *.bak

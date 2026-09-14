@@ -1,35 +1,111 @@
 #!/usr/bin/env bash
+# ⚠ 本脚本必须兼容 bash 3.2。
+#   cron 的 PATH 只有 /usr/bin:/bin，`#!/usr/bin/env bash` 会解析到 macOS
+#   自带的 /bin/bash 3.2.57 —— 那里没有 mapfile、也没有关联数组。
+#   所以全文只用 3.2 也支持的语法（数组本身可用，mapfile 不可用）。
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-XRAY_BIN="$SCRIPT_DIR/xray"
-LINK_FILE="${LINK_FILE:-`echo ~/vpn/link.txt`}"
+LINK_FILE="${LINK_FILE:-$HOME/vpn/link.txt}"
 HTTP_PORT="${HTTP_PORT:-7890}"
 if [[ "${1:-}" =~ ^[0-9]+$ ]]; then
   HTTP_PORT="$1"
 fi
 SOCKS_PORT="$((HTTP_PORT + 1))"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
+# 解析成绝对路径：cron 下 PATH 极简，而且 doctor 里显示绝对路径才能看出
+# 到底用的是哪一个解释器（系统/conda/托管版行为可能不同）。
+PYTHON_BIN="$(command -v "$PYTHON_BIN" 2>/dev/null || printf '%s' "$PYTHON_BIN")"
+# cron 下 stdout 可能落在 ASCII locale，Python 打印中文会 UnicodeEncodeError
+export PYTHONIOENCODING="${PYTHONIOENCODING:-utf-8}"
+export PYTHONDONTWRITEBYTECODE="${PYTHONDONTWRITEBYTECODE:-1}"
 
 PID_FILE="$SCRIPT_DIR/xray.pid"
 CONF_FILE="$SCRIPT_DIR/config.json"
 LOG_FILE="$SCRIPT_DIR/xray.log"
 SELECTED_FILE="$SCRIPT_DIR/selected_node.txt"
 LOCK_DIR="$SCRIPT_DIR/.start_cli.lock"
+PROBE_SCRIPT="$SCRIPT_DIR/node_probe.py"
 # geosite.dat / geoip.dat live next to the binary; make it explicit so the
 # CN-bypass rules resolve no matter which cwd start_cli.sh was invoked from.
 export XRAY_LOCATION_ASSET="$SCRIPT_DIR"
 GOOGLE_PROBE_URL="https://www.google.com/generate_204"
 YOUTUBE_PROBE_URL="https://www.youtube.com/"
 
+# ── xray 二进制解析（macOS / Linux 双平台）──────────────────────────
+# 位置优先级：XRAY_BIN 环境变量 > xray-<os>-<arch> > xray
+# 判定方式是真的执行一次 `xray version`：架构不匹配的二进制会被内核以
+# "Exec format error" 拒绝，这比用 file 命令猜平台可靠得多。
+XRAY_BIN=""
+
+resolve_xray_bin() {
+  local os arch suffix
+  case "$(uname -s)" in
+    Darwin) os="macos" ;;
+    Linux)  os="linux" ;;
+    *)      os="$(uname -s | tr '[:upper:]' '[:lower:]')" ;;
+  esac
+  case "$(uname -m)" in
+    arm64|aarch64) arch="arm64-v8a" ;;
+    x86_64|amd64)  arch="64" ;;
+    *)             arch="$(uname -m)" ;;
+  esac
+  suffix="${os}-${arch}"
+
+  local candidates="$SCRIPT_DIR/xray-${suffix} $SCRIPT_DIR/xray"
+  if [[ -n "${XRAY_BIN_OVERRIDE:-}" ]]; then
+    candidates="$XRAY_BIN_OVERRIDE $candidates"
+  fi
+
+  local c
+  for c in $candidates; do
+    [[ -f "$c" && -x "$c" ]] || continue
+    if "$c" version >/dev/null 2>&1; then
+      XRAY_BIN="$c"
+      return 0
+    fi
+    echo "跳过 ${c}：无法在本机执行（架构不匹配？）" >&2
+  done
+
+  echo "找不到可用的 xray 二进制（本机 $(uname -s)/$(uname -m)）。" >&2
+  echo "  期望：$SCRIPT_DIR/xray-${suffix}   或   $SCRIPT_DIR/xray" >&2
+  echo "  下载：https://github.com/XTLS/Xray-core/releases  选 Xray-${suffix}" >&2
+  return 1
+}
+
+# 单实例锁。必须是 mkdir 语义 —— macOS 上没有 flock（实测 /usr/bin/flock 不存在）。
+# 残留锁回收很重要：被 kill -9 或机器重启后锁目录会留下，旧实现会永久拒绝启动，
+# 而 cron 每分钟跑一次，症状就是「任务在跑但代理永远起不来」。
 acquire_start_lock() {
+  if [[ -d "$LOCK_DIR" ]]; then
+    local owner=""
+    [[ -f "$LOCK_DIR/pid" ]] && owner="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+
+    if [[ "$owner" =~ ^[0-9]+$ ]] && [[ "$owner" != "$$" ]] && kill -0 "$owner" 2>/dev/null; then
+      echo "另一个 start_cli.sh 正在运行 (pid $owner)，本次跳过。" >&2
+      exit 2
+    fi
+
+    local stale=0
+    if [[ "$owner" =~ ^[0-9]+$ ]]; then
+      stale=1   # pid 明确且进程已不存在 → 残留
+    elif [[ -n "$(find "$LOCK_DIR" -maxdepth 0 -mmin +10 2>/dev/null)" ]]; then
+      stale=1   # 没有 pid 文件，用锁目录年龄兜底
+    fi
+
+    if [[ "$stale" == "1" ]]; then
+      echo "回收残留锁 ${LOCK_DIR}（持有者 ${owner:-未知} 已不存在）" >&2
+      rm -rf "$LOCK_DIR"
+    fi
+  fi
+
   if mkdir "$LOCK_DIR" 2>/dev/null; then
     printf '%s\n' "$$" > "$LOCK_DIR/pid"
     trap 'rm -rf "$LOCK_DIR"' EXIT
     return 0
   fi
 
-  echo "Another vpn start is already running; refusing to start a new one." >&2
+  echo "另一个 vpn start 正在进行中，本次跳过。" >&2
   exit 2
 }
 
@@ -53,14 +129,22 @@ check_node_ok() {
 }
 
 check_node_stable() {
-  check_node_ok || return 1
-  # sleep 1
-  # check_node_ok || return 1
+  # 连测 N 轮都通过才录用。瞬时探测会放过「握手成功但传不动数据」的节点，
+  # 单纯依赖 1 次探测会导致在同一批烂节点之间反复横跳。
+  # 交互启动用 1 轮（快）；auto-heal 用 2 轮（准），由 cron 包装器设 NODE_STABLE_ROUNDS=2。
+  local rounds="${NODE_STABLE_ROUNDS:-1}"
+  local i=0
+  while [[ "$i" -lt "$rounds" ]]; do
+    check_node_ok || return 1
+    i=$((i + 1))
+    [[ "$i" -lt "$rounds" ]] && sleep 1
+  done
+  return 0
 }
 
 check_port_listening() {
   local port="$1"
-  python3 -c "import socket; s=socket.socket(); s.settimeout(1); s.connect(('127.0.0.1',$port)); s.close()" 2>/dev/null
+  "$PYTHON_BIN" -c "import socket; s=socket.socket(); s.settimeout(1); s.connect(('127.0.0.1',$port)); s.close()" 2>/dev/null
 }
 
 check_saved_xray_alive() {
@@ -71,32 +155,155 @@ check_saved_xray_alive() {
   kill -0 "$pid" 2>/dev/null
 }
 
-enable_system_proxy() {
-  if [[ "$(uname)" == "Darwin" ]]; then
-    local service="Wi-Fi"
-    networksetup -setwebproxy "$service" 127.0.0.1 "$HTTP_PORT"
-    networksetup -setsecurewebproxy "$service" 127.0.0.1 "$HTTP_PORT"
-    networksetup -setsocksfirewallproxy "$service" 127.0.0.1 "$SOCKS_PORT"
-
-    local bypass_file="$SCRIPT_DIR/bypass_domains.txt"
-    if [[ -f "$bypass_file" ]]; then
-      local -a bypass=()
-      local line
-      while IFS= read -r line || [[ -n "$line" ]]; do
-        line="${line%%#*}"
-        line="$(printf '%s' "$line" | tr -d '[:space:]')"
-        [[ -n "$line" ]] && bypass+=("$line")
-      done < "$bypass_file"
-      if [[ ${#bypass[@]} -gt 0 ]]; then
-        networksetup -setproxybypassdomains "$service" "${bypass[@]}"
-        echo "Bypass list applied: ${#bypass[@]} entries from bypass_domains.txt"
-      fi
-    else
-      networksetup -setproxybypassdomains "$service" 127.0.0.1 localhost \
-        192.168.0.0/16 10.0.0.0/8 172.16.0.0/12 "*.local" "169.254.0.0/16"
-    fi
-    echo "System proxy enabled (browser will use proxy automatically)"
+# ── 系统代理（macOS: networksetup / Linux: gsettings + proxy.env）──────
+# 两个平台都没有统一的代理开关，而且 headless/cron 下拿不到桌面会话总线，
+# 所以 Linux 侧额外落一份 proxy.env，source 一下即可在 shell 里用。
+bypass_entries() {
+  local f="$SCRIPT_DIR/bypass_domains.txt"
+  if [[ -f "$f" ]]; then
+    sed -e 's/#.*//' -e 's/[[:space:]]//g' "$f" | grep -v '^$' || true
+  else
+    printf '%s\n' 127.0.0.1 localhost 192.168.0.0/16 10.0.0.0/8 \
+      172.16.0.0/12 '*.local' '169.254.0.0/16'
   fi
+}
+
+# macOS 的网络服务名不一定是 "Wi-Fi"：中文系统、以太网、雷电网桥都会不同。
+# 这里先按默认路由的接口反查服务名，取不到再退化为第一个启用的服务。
+detect_net_service() {
+  if [[ -n "${VPN_NET_SERVICE:-}" ]]; then
+    printf '%s' "$VPN_NET_SERVICE"
+    return 0
+  fi
+
+  local iface svc
+  iface="$(route -n get default 2>/dev/null | awk '/interface:/{print $2; exit}')"
+  if [[ -n "$iface" ]]; then
+    svc="$(networksetup -listnetworkserviceorder 2>/dev/null | awk -v dev="$iface" '
+      /^\([0-9]+\)/ { svc = $0; sub(/^\([0-9]+\)[[:space:]]*/, "", svc); next }
+      $0 ~ ("Device: " dev "[,)]") { print svc; exit }')"
+    [[ -n "$svc" ]] && { printf '%s' "$svc"; return 0; }
+  fi
+
+  networksetup -listallnetworkservices 2>/dev/null \
+    | awk 'NR > 1 && $0 !~ /^\*/ { print; exit }' | tr -d '\n'
+}
+
+write_proxy_env() {
+  local no_proxy
+  no_proxy="$(bypass_entries | paste -sd, - 2>/dev/null || true)"
+  cat > "$SCRIPT_DIR/proxy.env" <<EOF
+# 由 start_cli.sh 自动生成：source 本文件即可在当前 shell 使用代理
+export http_proxy="http://127.0.0.1:${HTTP_PORT}"
+export https_proxy="\$http_proxy"
+export all_proxy="socks5h://127.0.0.1:${SOCKS_PORT}"
+export HTTP_PROXY="\$http_proxy"
+export HTTPS_PROXY="\$https_proxy"
+export ALL_PROXY="\$all_proxy"
+export no_proxy="127.0.0.1,localhost,${no_proxy}"
+export NO_PROXY="\$no_proxy"
+EOF
+}
+
+enable_system_proxy_macos() {
+  local service
+  service="$(detect_net_service)"
+  if [[ -z "$service" ]]; then
+    echo "未能识别网络服务名，跳过系统代理设置（可 export VPN_NET_SERVICE=...）" >&2
+    return 0
+  fi
+
+  networksetup -setwebproxy "$service" 127.0.0.1 "$HTTP_PORT" >/dev/null 2>&1 || true
+  networksetup -setsecurewebproxy "$service" 127.0.0.1 "$HTTP_PORT" >/dev/null 2>&1 || true
+  networksetup -setsocksfirewallproxy "$service" 127.0.0.1 "$SOCKS_PORT" >/dev/null 2>&1 || true
+
+  local -a bypass=()
+  local line
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -n "$line" ]] && bypass+=("$line")
+  done < <(bypass_entries)
+
+  if [[ ${#bypass[@]} -gt 0 ]]; then
+    networksetup -setproxybypassdomains "$service" "${bypass[@]}" >/dev/null 2>&1 || true
+    echo "系统代理已开启：${service}（绕过 ${#bypass[@]} 条）"
+  else
+    echo "系统代理已开启：$service"
+  fi
+}
+
+enable_system_proxy_linux() {
+  write_proxy_env
+
+  # gsettings 需要一个活的桌面会话总线；cron / ssh 下通常没有，静默退化
+  if command -v gsettings >/dev/null 2>&1 && [[ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
+    gsettings set org.gnome.system.proxy mode 'manual' >/dev/null 2>&1 || true
+    for pair in "http $HTTP_PORT" "https $HTTP_PORT" "socks $SOCKS_PORT"; do
+      set -- $pair
+      gsettings set "org.gnome.system.proxy.$1" host '127.0.0.1' >/dev/null 2>&1 || true
+      gsettings set "org.gnome.system.proxy.$1" port "$2" >/dev/null 2>&1 || true
+    done
+    echo "系统代理已开启：GNOME gsettings"
+  else
+    echo "已写 $SCRIPT_DIR/proxy.env（无桌面会话，未改全局设置）"
+    echo "  当前 shell 生效：source $SCRIPT_DIR/proxy.env"
+  fi
+}
+
+enable_system_proxy() {
+  case "$(uname -s)" in
+    Darwin) enable_system_proxy_macos ;;
+    Linux)  enable_system_proxy_linux ;;
+    *)      echo "未适配的系统，跳过系统代理设置（手动用 http://127.0.0.1:${HTTP_PORT}）" ;;
+  esac
+  return 0
+}
+
+disable_system_proxy() {
+  case "$(uname -s)" in
+    Darwin)
+      local service
+      service="$(detect_net_service)"
+      if [[ -n "$service" ]]; then
+        networksetup -setwebproxystate "$service" off >/dev/null 2>&1 || true
+        networksetup -setsecurewebproxystate "$service" off >/dev/null 2>&1 || true
+        networksetup -setsocksfirewallproxystate "$service" off >/dev/null 2>&1 || true
+        echo "系统代理已关闭：$service"
+      fi
+      ;;
+    Linux)
+      if command -v gsettings >/dev/null 2>&1 && [[ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
+        gsettings set org.gnome.system.proxy mode 'none' >/dev/null 2>&1 || true
+        echo "系统代理已关闭：GNOME gsettings"
+      fi
+      rm -f "$SCRIPT_DIR/proxy.env"
+      echo "已移除 proxy.env"
+      ;;
+  esac
+  return 0
+}
+
+proxy_status() {
+  case "$(uname -s)" in
+    Darwin)
+      local service
+      service="$(detect_net_service)"
+      echo "网络服务: ${service:-未识别}"
+      [[ -n "$service" ]] && networksetup -getwebproxy "$service" 2>/dev/null
+      [[ -n "$service" ]] && networksetup -getsecurewebproxy "$service" 2>/dev/null
+      [[ -n "$service" ]] && networksetup -getsocksfirewallproxy "$service" 2>/dev/null
+      ;;
+    Linux)
+      if command -v gsettings >/dev/null 2>&1; then
+        gsettings get org.gnome.system.proxy mode 2>/dev/null || true
+      fi
+      if [[ -f "$SCRIPT_DIR/proxy.env" ]]; then
+        echo "proxy.env 存在（source 后生效）"
+      else
+        echo "proxy.env 不存在"
+      fi
+      ;;
+  esac
+  return 0
 }
 
 # ─────────────────────────── 健康度采样 ───────────────────────────
@@ -117,6 +324,19 @@ NODE_STATS="$SCRIPT_DIR/node_stats.py"
 RANK_WINDOW="${RANK_WINDOW:-86400}"               # 排序统计窗口：24h
 NODE_COOLDOWN="${NODE_COOLDOWN:-3600}"            # 失败冷却：1h
 DEFAULT_NODE_RATIO="${DEFAULT_NODE_RATIO:-0.85}"  # 未探测节点的先验可用率
+# 单次自愈的总时长上限。cron 每分钟触发一次，坏节点太多时一次尝试可能拖很久，
+# 后续触发会被单实例锁挡在门外（这是有意的），但也不能无限期拖着。
+MAX_HEAL_SECONDS="${MAX_HEAL_SECONDS:-180}"
+HEAL_DEADLINE=0
+
+heal_start_clock() {
+  HEAL_DEADLINE=$(( $(date +%s) + MAX_HEAL_SECONDS ))
+}
+
+heal_expired() {
+  [[ "$HEAL_DEADLINE" -eq 0 ]] && return 1
+  [[ "$(date +%s)" -ge "$HEAL_DEADLINE" ]]
+}
 
 # 从 selected_node.txt 读出当前选中的 link.txt 行号；读不到返回 "-"
 current_node_id() {
@@ -126,6 +346,25 @@ current_node_id() {
   awk -F= '$1=="node_id"{print $2; exit}' "$f" 2>/dev/null | tr -d '[:space:]' | grep -E '^[0-9]+$' \
     || awk -F= '$1=="source_line"{print $2; exit}' "$f" 2>/dev/null | tr -d '[:space:]' | grep -E '^[0-9]+$' \
     || echo "-"
+}
+
+# 安全的节点摘要：只输出 node_id / protocol，**不**输出 link 行本身。
+# selected_node.txt 里存的 link 含 UUID/密码，而 print_success 的输出会被
+# cron 包装器写进 cron.log —— 直接 tr 出来等于把凭据落到日志文件里。
+current_node_summary() {
+  local f="$SCRIPT_DIR/selected_node.txt"
+  [[ -f "$f" ]] || { echo "node=-"; return; }
+  local id proto
+  id="$(current_node_id)"
+  proto="$(awk -F= '$1=="protocol"{print $2; exit}' "$f" 2>/dev/null | tr -d '[:space:]')"
+  echo "node=${id}${proto:+ (${proto})}"
+}
+
+# link.txt 的行数。用 Python 的 splitlines 而不是 wc -l：
+# 末行没有换行符时 wc -l 会少算一行，而行号体系必须与它严格一致。
+link_total_lines() {
+  "$PYTHON_BIN" -c 'import sys; print(len(open(sys.argv[1], encoding="utf-8", errors="replace").read().splitlines()))' "$LINK_FILE" 2>/dev/null \
+    || echo 0
 }
 
 log_health() {
@@ -283,6 +522,139 @@ if outages:
 PY
 }
 
+# ── 自检 ───────────────────────────────────────────────────────────
+doctor() {
+  local ok="✓" bad="✗" warn="!"
+  local script_dir_note=""
+
+  echo "=== 环境 ==="
+  echo "  系统        $(uname -s) $(uname -m)"
+  echo "  项目目录    $SCRIPT_DIR"
+  [[ -w "$SCRIPT_DIR" ]] && echo "  目录可写    $ok" || echo "  目录可写    ${bad}（无法写日志/配置）"
+
+  local bv
+  bv="$(bash --version 2>/dev/null | head -1)"
+  echo "  bash        $BASH_VERSION"
+  case "$BASH_VERSION" in
+    3.2*) echo "              ${warn} 3.2 —— 本脚本已做兼容（不用 mapfile），但建议装 bash 5" ;;
+  esac
+
+  echo "  PYTHON_BIN  $PYTHON_BIN"
+  if [[ ! -x "$PYTHON_BIN" ]] && ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+    echo "  python      ${bad} 找不到解释器。cron 的 PATH 只有 /usr/bin:/bin，"
+    echo "              请通过 vpn-cron.sh 调用，或在 crontab 里显式设 PYTHON_BIN。"
+  elif "$PYTHON_BIN" -c 'import sys; sys.exit(0 if sys.version_info>=(3,9) else 1)' 2>/dev/null; then
+    echo "  python      $("$PYTHON_BIN" -V 2>&1)  $ok"
+  else
+    echo "  python      ${bad} 需要 3.9+（node_stats.py 用了 dict[str, ...] 注解）"
+  fi
+
+  local missing=""
+  for f in gen_xray_config.py node_stats.py node_probe.py link.txt; do
+    [[ -r "$SCRIPT_DIR/$f" ]] || missing="$missing $f"
+  done
+  if [[ -z "$missing" ]]; then
+    echo "  依赖文件    $ok"
+  else
+    echo "  依赖文件    $bad 缺失:$missing"
+  fi
+  if [[ ! -r "$PROBE_SCRIPT" ]]; then
+    echo "              ${warn} node_probe.py 不可读，TCP 预筛会退化为全量候选"
+  fi
+
+  # 脚本卫生：`$var` 后面紧跟中文/全角字符时，在**没有 locale** 的环境里
+  # （正是 cron）bash 会把多字节字符当成变量名的一部分，报「未绑定的变量」
+  # 并让自愈静默失败。这个坑只在剥离环境里暴露，所以固定放进自检。
+  local bad_expand=""
+  bad_expand="$("$PYTHON_BIN" - "$SCRIPT_DIR" <<'PY'
+import pathlib, re, sys
+pat = re.compile(r'\$[A-Za-z_][A-Za-z0-9_]*(?=[^\x00-\x7f])')
+out = []
+for name in ('start_cli.sh', 'vpn-cron.sh', 'install-cron.sh'):
+    p = pathlib.Path(sys.argv[1]) / name
+    if not p.exists():
+        continue
+    for i, line in enumerate(p.read_text(encoding='utf-8').splitlines(), 1):
+        if pat.search(line):
+            out.append(f'{name}:{i}')
+print(' '.join(out))
+PY
+)"
+  if [[ -n "$bad_expand" ]]; then
+    echo "  脚本卫生    ${warn} \$var 后紧跟非 ASCII 字符，cron 下会被解析成变量名："
+    echo "              $bad_expand"
+    echo "              修法：改用 \${var} 形式"
+  else
+    echo "  脚本卫生    $ok"
+  fi
+
+  echo
+  echo "=== xray ==="
+  if resolve_xray_bin 2>/dev/null; then
+    echo "  二进制      $XRAY_BIN"
+    echo "  版本        $("$XRAY_BIN" version 2>/dev/null | head -2 | tr '\n' ' ')"
+    script_dir_note="$XRAY_BIN"
+  else
+    echo "  二进制      $bad 未找到可执行文件（详见下方报错）"
+    resolve_xray_bin 2>&1 | sed 's/^/              /'
+  fi
+  for f in geoip.dat geosite.dat; do
+    [[ -f "$SCRIPT_DIR/$f" ]] && echo "  $f  $ok" || echo "  $f  $bad 缺失（分流规则会失效）"
+  done
+
+  echo
+  echo "=== 节点池 ==="
+  if [[ -r "$SCRIPT_DIR/$PROBE_SCRIPT" || -r "$PROBE_SCRIPT" ]]; then
+    local total cand
+    total="$(link_total_lines)"
+    cand="$("$PYTHON_BIN" "$PROBE_SCRIPT" list --links "$LINK_FILE" 2>/dev/null | wc -l | tr -d ' ')"
+    echo "  link.txt    $total 行"
+    echo "  候选        $cand 个（已排除香港）"
+  else
+    echo "  候选        $bad node_probe.py 缺失，无法统计"
+  fi
+
+  echo
+  echo "=== 运行状态 ==="
+  if check_port_listening "$HTTP_PORT"; then
+    echo "  端口 $HTTP_PORT  监听中 $ok"
+  else
+    echo "  端口 $HTTP_PORT  未监听 $bad"
+  fi
+  if check_saved_xray_alive; then
+    echo "  xray 进程   pid=$(cat "$PID_FILE" 2>/dev/null) $ok"
+  else
+    echo "  xray 进程   未运行（或 pid 文件缺失）"
+  fi
+  if [[ -f "$SELECTED_FILE" ]]; then
+    echo "  当前节点    $(current_node_summary)"
+  fi
+  [[ -d "$LOCK_DIR" ]] && echo "  锁          ${warn} $LOCK_DIR 存在（若有进程持有则属正常）"
+
+  echo
+  echo "=== 健康采样 ==="
+  if [[ -s "$HEALTH_LOG" ]]; then
+    echo "  样本        $(wc -l < "$HEALTH_LOG" | tr -d ' ') 条"
+    echo "  最新         $(tail -1 "$HEALTH_LOG")"
+    local age
+    age="$("$PYTHON_BIN" - "$HEALTH_LOG" <<'PY'
+import datetime, pathlib, sys
+line = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace").strip().splitlines()[-1]
+ts = datetime.datetime.strptime(line.split()[0], "%Y-%m-%dT%H:%M:%S%z")
+print(int((datetime.datetime.now().astimezone() - ts).total_seconds() // 60))
+PY
+)"
+    if [[ "$age" =~ ^[0-9]+$ ]] && [[ "$age" -le 5 ]]; then
+      echo "  采样间隔    ${age} 分钟前 $ok"
+    else
+      echo "  采样间隔    ${age:-?} 分钟前 ${warn}（>5 分钟说明定时任务可能没在跑）"
+    fi
+  else
+    echo "  样本        ${warn} 还没有采样数据，先跑一次 auto-heal"
+  fi
+  return 0
+}
+
 # auto-heal 分支会自己记账，用它标记避免脚本末尾重复采样
 PROBE_DONE=0
 
@@ -297,7 +669,7 @@ case "${1:-}" in
       --window "$RANK_WINDOW" \
       --cooldown "$NODE_COOLDOWN" \
       --default-ratio "$DEFAULT_NODE_RATIO" \
-      --total-lines "$(wc -l < "$LINK_FILE" | tr -d ' ')"
+      --total-lines "$(link_total_lines)"
     exit 0
     ;;
   health-probe)
@@ -307,6 +679,9 @@ case "${1:-}" in
   auto-heal)
     # 给定时任务用：先记一次账，UP 就直接退出；
     # DOWN 则顺势落到下面的启动流程 —— 重新排序候选、换节点、把 xray 拉起来。
+    # 这里默认要求连测 2 轮（比交互启动严），因为 cron 每分钟才给一次机会，
+    # 误判成 UP 会白等一分钟。
+    NODE_STABLE_ROUNDS="${NODE_STABLE_ROUNDS:-2}"
     HEAL_OK="$(health_sample)"
     log_health "$HEAL_OK"
     if [[ "$HEAL_OK" == "1" ]]; then
@@ -315,6 +690,22 @@ case "${1:-}" in
     fi
     printf '%s  DOWN  (node=%s) — 触发自动重连\n' "$(date '+%H:%M:%S')" "$(current_node_id)"
     PROBE_DONE=1
+    ;;
+  proxy-on)
+    enable_system_proxy
+    exit 0
+    ;;
+  proxy-off)
+    disable_system_proxy
+    exit 0
+    ;;
+  proxy-status)
+    proxy_status
+    exit 0
+    ;;
+  doctor)
+    doctor
+    exit 0
     ;;
   health-watch)
     health_watch
@@ -325,15 +716,18 @@ case "${1:-}" in
 用法:
   bash start_cli.sh [端口] [link.txt行号]  启动/复用代理(默认 7890)
      第 2 个参数是 link.txt 的行号(1-based)，与 health.log 第 3 列同一套编号。
-     省略则自动选：ping 可达 + 未冷却 + 历史可用率最高的节点。
+     省略则自动选：TCP 可达 + 未冷却 + 历史可用率最高的节点。
   bash start_cli.sh nodes                 各节点健康报告(期望可用率 / 冷却状态)
   bash start_cli.sh health                整体 UP ratio 报告
   bash start_cli.sh health-probe          采样一次并追加 1/0 到 health.log(纯记账)
-  bash start_cli.sh auto-heal             采样 + 断线时自动换节点重连(推荐给 launchd)
+  bash start_cli.sh auto-heal             采样 + 断线时自动换节点重连(定时任务用)
   bash start_cli.sh health-watch          前台循环采样(间隔 HEALTH_INTERVAL 秒)
+  bash start_cli.sh proxy-on|off|status   系统代理开关(macOS / Linux 自动分派)
+  bash start_cli.sh doctor                自检：xray / python / 节点池 / 当前状态
 
 health.log 格式: <ISO8601> <1|0> <link.txt行号>
 策略参数可用环境变量覆盖：RANK_WINDOW=86400 NODE_COOLDOWN=3600 DEFAULT_NODE_RATIO=0.85
+                         NODE_STABLE_ROUNDS=2 MAX_HEAL_SECONDS=180
 EOF
     exit 0
     ;;
@@ -349,15 +743,14 @@ if [[ "$PROBE_DONE" != "1" ]]; then
 fi
 
 acquire_start_lock
+heal_start_clock
 
-if [[ ! -x "$XRAY_BIN" ]]; then
-  echo "xray binary not found: $XRAY_BIN" >&2
-  exit 1
-fi
 if [[ ! -f "$LINK_FILE" ]]; then
   echo "link file not found: $LINK_FILE" >&2
   exit 1
 fi
+
+resolve_xray_bin || exit 1
 
 # Reuse a live local proxy only when real Google and YouTube traffic works.
 if check_port_listening "$HTTP_PORT" && check_saved_xray_alive; then
@@ -373,7 +766,7 @@ if check_port_listening "$HTTP_PORT" && check_saved_xray_alive; then
     echo "socks5://127.0.0.1:${SOCKS_PORT}"
     echo "pid=$(cat "$PID_FILE")"
     if [[ -f "$SELECTED_FILE" ]]; then
-      echo "node=$(tr '\n' ' ' < "$SELECTED_FILE")"
+      echo "$(current_node_summary)"
     fi
     exit 0
   fi
@@ -390,17 +783,9 @@ rm -f "$PID_FILE"
 # 与 health.log 第 3 列、node_stats.py 的排名、--line 参数完全一致。
 # 香港过滤由 gen_xray_config.is_hongkong_url 负责 —— 它会 base64 解码
 # vmess 的 ps 字段再判断，明文匹配做不到这件事。
+# 枚举逻辑统一收在 node_probe.py 里，避免同一套规则散在两个地方。
 list_candidate_lines() {
-  "$PYTHON_BIN" - "$LINK_FILE" <<PYEOF
-import pathlib, sys
-sys.path.insert(0, '$SCRIPT_DIR')
-from gen_xray_config import parse_link, is_hongkong_url
-
-lines = pathlib.Path(sys.argv[1]).read_text(encoding='utf-8').splitlines()
-for i, line in enumerate(lines, start=1):
-    if not is_hongkong_url(line) and parse_link(line.strip()):
-        print(i)
-PYEOF
+  "$PYTHON_BIN" "$PROBE_SCRIPT" list --links "$LINK_FILE"
 }
 
 # 策略 1 + 策略 2 的落点：把候选丢给 node_stats.py，
@@ -417,8 +802,15 @@ rank_candidates() {
     --format lines "$@" 2>/dev/null
 }
 
+# 起 xray 并验证。成功 0，失败 1。
+# 提到 MAX_HEAL_SECONDS 就立刻放弃，把这一分钟的时间留给下一次 cron 触发。
 try_node() {
   local line_no="$1"
+
+  if heal_expired; then
+    echo "已达自愈时长上限 ${MAX_HEAL_SECONDS}s，停止继续尝试" >&2
+    return 1
+  fi
 
   # 按 link.txt 行号寻址（与 health.log 第 3 列同一套编号）
   "$PYTHON_BIN" "$SCRIPT_DIR/gen_xray_config.py" \
@@ -429,6 +821,8 @@ try_node() {
     --out "$CONF_FILE" \
     --selected "$SELECTED_FILE" || return 1
 
+  # 后台拉起并脱离当前会话，cron 任务结束时 xray 必须活着。
+  # macOS 没有 setsid，nohup 两个平台都有。
   nohup "$XRAY_BIN" run -c "$CONF_FILE" >"$LOG_FILE" 2>&1 &
   local pid=$!
   echo "$pid" > "$PID_FILE"
@@ -449,65 +843,54 @@ try_node() {
   fi
 }
 
-# 并行 ping 预筛 + 按历史可用率排序后依次尝试。
-#   第 1 轮：ping 可达 且 未冷却，按期望可用率降序 —— 策略 1 + 策略 2
-#   第 2 轮：放开 ping 与冷却限制兜底，避免「全部处于冷却中」或
-#            「服务器禁 ICMP」时无节点可用
+# 依次尝试一个排好序的行号文件，命中即返回 0。
+# 刻意不用数组也不用 mapfile —— bash 3.2（macOS 自带）没有 mapfile。
+# $2 是描述文本，$3 是透传给 node_stats.py rank 的额外参数（如 --ignore-cooldown）。
+try_ranked_list() {
+  local list_file="$1" label="$2" extra="${3:-}"
+  local ranked_file n count
+
+  ranked_file="$(mktemp)"
+  # shellcheck disable=SC2086
+  rank_candidates "$list_file" $extra > "$ranked_file" || true
+
+  count="$(wc -l < "$ranked_file" | tr -d ' ')"
+  echo "${label}（$count 个）"
+
+  while IFS= read -r n || [[ -n "$n" ]]; do
+    [[ -n "$n" ]] || continue
+    [[ "$TRIED" == *" $n "* ]] && continue
+    printf '  link.txt 第 %-4s 行 ' "$n"
+    if try_node "$n"; then
+      echo "OK"
+      rm -f "$ranked_file"
+      return 0
+    fi
+    echo "FAIL"
+    TRIED="$TRIED$n "
+  done < "$ranked_file"
+
+  rm -f "$ranked_file"
+  return 1
+}
+
+# 预筛 + 排序后依次尝试（函数名沿用了历史的 fast_ping_nodes）。
+#   第 1 轮：TCP 可达 且 未冷却，按期望可用率降序 —— 策略 1 + 策略 2
+#   第 2 轮：放开 TCP 与冷却限制兜底，避免「候选全在冷却中」时无节点可用
+#
+# 预筛为什么不是 ICMP ping：macOS 的 `ping -W` 是毫秒、Linux 是秒，
+# Linux 的 `-t` 是 TTL 而 macOS 的 `-t` 才是总超时，同一行命令无法两边都对；
+# 更要紧的是大量节点禁 ICMP —— 实测 ip.jkcnin.com 那批 IEPL 节点
+# TCP 44~70ms 稳定可达却完全不回 ping，用 ping 筛会把最好的线路整批误杀。
+# 现在交给 node_probe.py 用 TCP connect 探真实服务端口，纯标准库、跨平台一致。
 fast_ping_nodes() {
   local tmpdir
   tmpdir="$(mktemp -d)"
   trap "rm -rf '$tmpdir'" RETURN
 
-  echo "Parallel-pinging candidate nodes..."
+  echo "TCP 预筛候选节点..."
 
-  "$PYTHON_BIN" - "$LINK_FILE" "$tmpdir" <<PYEOF
-import concurrent.futures
-import pathlib
-import subprocess
-import sys
-
-sys.path.insert(0, '$SCRIPT_DIR')
-from gen_xray_config import parse_link, is_hongkong_url
-
-link_file, tmpdir = sys.argv[1], sys.argv[2]
-lines = pathlib.Path(link_file).read_text(encoding='utf-8').splitlines()
-BATCH_SIZE = 12
-PING_TIMEOUT = 3
-
-
-def server_address(outbound):
-    settings = outbound.get('settings', {})
-    if 'vnext' in settings:
-        return settings['vnext'][0].get('address')
-    if 'servers' in settings:
-        return settings['servers'][0].get('address')
-    return None
-
-
-def ping(line_no):
-    parsed = parse_link(lines[line_no - 1].strip())
-    if not parsed:
-        return None
-    addr = server_address(parsed[0])
-    if not addr:
-        return None
-    rc = subprocess.run(
-        ['ping', '-c', '1', '-W', str(PING_TIMEOUT), addr],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    ).returncode
-    return line_no if rc == 0 else None
-
-
-candidates = [i for i, l in enumerate(lines, start=1)
-              if not is_hongkong_url(l) and parse_link(l.strip())]
-
-with concurrent.futures.ThreadPoolExecutor(max_workers=BATCH_SIZE) as ex:
-    reachable = sorted(r for r in ex.map(ping, candidates) if r is not None)
-
-pathlib.Path(tmpdir, 'candidates.txt').write_text('\n'.join(map(str, candidates)))
-pathlib.Path(tmpdir, 'reachable.txt').write_text('\n'.join(map(str, reachable)))
-print(f"候选 {len(candidates)} 个 / ping 可达 {len(reachable)} 个", file=sys.stderr)
-PYEOF
+  "$PYTHON_BIN" "$PROBE_SCRIPT" scan --links "$LINK_FILE" --out-dir "$tmpdir"
 
   local cand="$tmpdir/candidates.txt"
   local reach="$tmpdir/reachable.txt"
@@ -517,32 +900,15 @@ PYEOF
     return 1
   fi
 
-  local tried=" "
-  local n
-  local -a round1=()
-  local -a round2=()
-
+  TRIED=" "
   if [[ -s "$reach" ]]; then
-    mapfile -t round1 < <(rank_candidates "$reach")
+    try_ranked_list "$reach" "第 1 轮：TCP 可达 + 未冷却 + 历史可用率降序" && return 0
   fi
-
-  echo "第 1 轮：ping 可达 + 未冷却 + 历史可用率降序（${#round1[@]} 个）"
-  for n in ${round1[@]+"${round1[@]}"}; do
-    printf '  link.txt 第 %-4s 行 ' "$n"
-    if try_node "$n"; then echo "OK"; return 0; fi
-    echo "FAIL"
-    tried="$tried$n "
-  done
-
-  mapfile -t round2 < <(rank_candidates "$cand" --ignore-cooldown)
-  echo "第 2 轮：放开 ping / 冷却限制兜底（${#round2[@]} 个候选）"
-  for n in ${round2[@]+"${round2[@]}"}; do
-    if [[ "$tried" == *" $n "* ]]; then continue; fi
-    printf '  link.txt 第 %-4s 行 ' "$n"
-    if try_node "$n"; then echo "OK"; return 0; fi
-    echo "FAIL"
-    tried="$tried$n "
-  done
+  if heal_expired; then
+    echo "已达自愈时长上限，跳过第 2 轮" >&2
+    return 1
+  fi
+  try_ranked_list "$cand" "第 2 轮：放开 TCP / 冷却限制兜底" "--ignore-cooldown" && return 0
 
   return 1
 }
@@ -553,7 +919,7 @@ print_success() {
   echo "http://127.0.0.1:${HTTP_PORT}"
   echo "socks5://127.0.0.1:${SOCKS_PORT}"
   echo "pid=$(cat "$PID_FILE")"
-  echo "node=$(tr '\n' ' ' < "$SELECTED_FILE")"
+  echo "$(current_node_summary)"
 }
 
 if [[ -n "${2:-}" ]]; then
@@ -572,22 +938,18 @@ else
     exit 0
   fi
 
-  # 兜底：全部候选（不限 ping 结果、忽略冷却）按历史可用率再扫一轮
-  echo "自动选节点未成功，改为全量候选 + 忽略冷却再扫一轮..." >&2
+  # 兜底：全量候选（不限 TCP 结果、忽略冷却）按历史可用率再扫一轮。
+  # 只在 fast_ping_nodes 提前退出（预筛没产出文件 / 超时）时才有实际作用；
+  # TRIED 是同一个变量，已经试过并失败的节点不会被重复尝试。
+  echo "前两轮未成功，改为全量候选再扫一轮..." >&2
   cand_file="$(mktemp)"
   list_candidate_lines > "$cand_file"
-  mapfile -t all_candidates < <(rank_candidates "$cand_file" --ignore-cooldown)
+  if try_ranked_list "$cand_file" "第 3 轮：全量候选 + 忽略冷却" "--ignore-cooldown"; then
+    rm -f "$cand_file"
+    print_success
+    exit 0
+  fi
   rm -f "$cand_file"
-
-  for n in ${all_candidates[@]+"${all_candidates[@]}"}; do
-    printf '  link.txt 第 %-4s 行 ' "$n"
-    if try_node "$n"; then
-      echo "OK"
-      print_success
-      exit 0
-    fi
-    echo "FAIL"
-  done
 
   echo "所有候选节点均失败，详见 $LOG_FILE" >&2
   exit 3

@@ -1,32 +1,20 @@
-#!/bin/bash
-# Toggle macOS system proxy on/off for Wi-Fi
-# Usage: ./proxy_switch.sh on|off|status
+#!/usr/bin/env bash
+# 系统代理开关（macOS / Linux 通用）
+#   ./proxy_switch.sh on|off|status
+#
+# 真正的实现只有一份，在 start_cli.sh 的 proxy-on / proxy-off / proxy-status：
+#   macOS → networksetup（网络服务名自动探测，不再硬编码 "Wi-Fi"）
+#   Linux → gsettings（有桌面会话时）+ 生成 proxy.env（headless/cron 下可用）
+set -uo pipefail
 
-SERVICE="Wi-Fi"
-HTTP_PORT=7890
-SOCKS_PORT=7891
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-case "$1" in
-  on)
-    networksetup -setwebproxy "$SERVICE" 127.0.0.1 $HTTP_PORT
-    networksetup -setsecurewebproxy "$SERVICE" 127.0.0.1 $HTTP_PORT
-    networksetup -setsocksfirewallproxy "$SERVICE" 127.0.0.1 $SOCKS_PORT
-    networksetup -setproxybypassdomains "$SERVICE" 127.0.0.1 localhost 192.168.0.0/16 10.0.0.0/8 172.16.0.0/12 "*.local" "169.254.0.0/16"
-    echo "✅ System proxy ON (HTTP:$HTTP_PORT SOCKS:$SOCKS_PORT)"
-    ;;
-  off)
-    networksetup -setwebproxystate "$SERVICE" off
-    networksetup -setsecurewebproxystate "$SERVICE" off
-    networksetup -setsocksfirewallproxystate "$SERVICE" off
-    echo "❌ System proxy OFF"
-    ;;
-  status)
-    echo "=== HTTP ===" && networksetup -getwebproxy "$SERVICE"
-    echo "=== HTTPS ===" && networksetup -getsecurewebproxy "$SERVICE"
-    echo "=== SOCKS ===" && networksetup -getsocksfirewallproxy "$SERVICE"
-    ;;
+case "${1:-status}" in
+  on)      exec bash "$SCRIPT_DIR/start_cli.sh" proxy-on ;;
+  off)     exec bash "$SCRIPT_DIR/start_cli.sh" proxy-off ;;
+  status)  exec bash "$SCRIPT_DIR/start_cli.sh" proxy-status ;;
   *)
-    echo "Usage: $0 {on|off|status}"
+    echo "用法: $0 {on|off|status}" >&2
     exit 1
     ;;
 esac
