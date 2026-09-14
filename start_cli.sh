@@ -164,14 +164,28 @@ probe_url() {
     "$url" 2>/dev/null || true
 }
 
+# 最近一次探测的明细，形如 google=204,youtube=200 或 google=000。
+# 用逗号分隔保持「一个字段」的形态，health.log 才能既带上原因又不破坏列对齐。
+PROBE_DIAG=""
+
 check_node_ok() {
   local google_code youtube_code
   google_code="$(probe_url "$GOOGLE_PROBE_URL")"
+  google_code="${google_code:-000}"
+  # Google 不通就没必要再花 6s 探 YouTube —— 一次采样最多省一半时间。
+  # 明细照样落 PROBE_DIAG，抖动到底卡在哪一段有据可查。
+  if [[ "$google_code" != "204" ]]; then
+    PROBE_DIAG="google=${google_code}"
+    echo "Proxy check failed: google=${google_code}" >&2
+    return 1
+  fi
   youtube_code="$(probe_url "$YOUTUBE_PROBE_URL")"
-  if [[ "$google_code" == "204" && "$youtube_code" =~ ^2[0-9][0-9]$ ]]; then
+  youtube_code="${youtube_code:-000}"
+  PROBE_DIAG="google=204,youtube=${youtube_code}"
+  if [[ "$youtube_code" =~ ^2[0-9][0-9]$ ]]; then
     return 0
   fi
-  echo "Proxy check failed: google=${google_code:-000} youtube=${youtube_code:-000}" >&2
+  echo "Proxy check failed: google=204 youtube=${youtube_code}" >&2
   return 1
 }
 
@@ -361,6 +375,10 @@ proxy_status() {
 #   写不进去时记 "-"（如还没选过节点 / 代理完全没起来过）
 #   老格式（只有 2 列）报告里仍兼容解析为 node="-"
 HEALTH_INTERVAL="${HEALTH_INTERVAL:-60}"
+# 采样确认轮数：一次 curl 探测在劣化线路上抖动极大，单发失败就记账会把「抖」
+# 写成「故障」，进而把好节点推进冷却名单 —— 而它其实还在服务（见下方 auto-heal）。
+# 规则：任一轮通过即记 1；全部轮次失败才记 0。0 从此等价于「确认不可用」。
+HEALTH_CONFIRM_ROUNDS="${HEALTH_CONFIRM_ROUNDS:-2}"
 
 # ── 选节点策略参数 ─────────────────────────────────────────────────
 # 策略 1：候选节点按 health.log 的历史期望可用率降序尝试，不再按 link.txt 顺序，
@@ -413,35 +431,58 @@ link_total_lines() {
 }
 
 log_health() {
-  # 参数 1：1/0   参数 2：节点行号（可选，默认 "-"）
-  local ok="${1:-0}" node="${2:-$(current_node_id)}"
-  printf '%s %s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$ok" "$node" >> "$HEALTH_LOG"
-}
-
-# 采样一次，输出 1 或 0（不写日志）
-health_sample() {
-  if check_port_listening "$HTTP_PORT" && check_node_ok 2>/dev/null; then
-    echo 1
+  # 参数 1：1/0   参数 2：节点行号（可选，默认 "-"）   参数 3：失败明细（可选）
+  local ok="${1:-0}" node="${2:-$(current_node_id)}" diag="${3:-}"
+  if [[ -n "$diag" ]]; then
+    printf '%s %s %s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$ok" "$node" "$diag" >> "$HEALTH_LOG"
   else
-    echo 0
+    printf '%s %s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$ok" "$node" >> "$HEALTH_LOG"
   fi
 }
 
-# 采样一次并追加到 health.log（自动带上当前节点行号）
+# ── 采样状态（直接写全局，避免 $( ) 子 shell 把明细丢掉）────────────
+# HEALTH_OK   1/0
+# HEALTH_DIAG 探测明细；port-closed 表示 xray 本地端口都没在监听
+HEALTH_OK="0"
+HEALTH_DIAG=""
+
+health_check_state() {
+  local rounds="${HEALTH_CONFIRM_ROUNDS:-2}" i=0
+  HEALTH_OK="0"
+  HEALTH_DIAG="port-closed"
+  if ! check_port_listening "$HTTP_PORT"; then
+    return 0
+  fi
+  while [[ "$i" -lt "$rounds" ]]; do
+    i=$((i + 1))
+    if check_node_ok 2>/dev/null; then
+      HEALTH_OK="1"
+      HEALTH_DIAG="$PROBE_DIAG"
+      return 0
+    fi
+    HEALTH_DIAG="$PROBE_DIAG"
+    if [[ "$i" -lt "$rounds" ]]; then
+      sleep 1
+    fi
+  done
+  return 0
+}
+
+# 采样一次并追加到 health.log（自动带上当前节点行号与失败明细）
 health_probe_once() {
-  log_health "$(health_sample)"
+  health_check_state
+  log_health "$HEALTH_OK" "$(current_node_id)" "$HEALTH_DIAG"
 }
 
 health_watch() {
-  echo "每 ${HEALTH_INTERVAL}s 采样一次 -> $HEALTH_LOG （Ctrl-C 停止）"
+  echo "每 ${HEALTH_INTERVAL}s 采样一次（连续 ${HEALTH_CONFIRM_ROUNDS} 轮）-> $HEALTH_LOG （Ctrl-C 停止）"
   while true; do
-    local ok
-    ok="$(health_sample)"
-    log_health "$ok"
-    if [[ "$ok" == "1" ]]; then
-      printf '%s  UP    (http://127.0.0.1:%s, node=%s)\n' "$(date '+%H:%M:%S')" "$HTTP_PORT" "$(current_node_id)"
+    health_check_state
+    log_health "$HEALTH_OK" "$(current_node_id)" "$HEALTH_DIAG"
+    if [[ "$HEALTH_OK" == "1" ]]; then
+      printf '%s  UP    (http://127.0.0.1:%s, node=%s)  %s\n' "$(date '+%H:%M:%S')" "$HTTP_PORT" "$(current_node_id)" "$HEALTH_DIAG"
     else
-      printf '%s  DOWN  (node=%s)\n' "$(date '+%H:%M:%S')" "$(current_node_id)"
+      printf '%s  DOWN  (node=%s)  %s\n' "$(date '+%H:%M:%S')" "$(current_node_id)" "$HEALTH_DIAG"
     fi
     sleep "$HEALTH_INTERVAL"
   done
@@ -460,14 +501,19 @@ if not path.exists() or path.stat().st_size == 0:
 rows, skipped = [], 0
 for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
     parts = line.split()
-    # 兼容 2 列老格式和 3 列新格式
-    if len(parts) == 2 and parts[1] in ("0", "1"):
+    # 兼容 3 种格式：
+    #   2 列老格式  <ts> <1|0>
+    #   3 列带节点  <ts> <1|0> <link.txt行号>
+    #   4 列带明细  <ts> <1|0> <link.txt行号> <google=..,youtube=..>
+    if len(parts) >= 3 and parts[1] in ("0", "1"):
+        ts_str, val, node = parts[0], parts[1], parts[2]
+    elif len(parts) == 2 and parts[1] in ("0", "1"):
         ts_str, val, node = parts[0], parts[1], "-"
-    elif len(parts) == 3 and parts[1] in ("0", "1"):
-        ts_str, val, node = parts
     else:
         skipped += 1
         continue
+    if node != "-" and not node.isdigit():
+        node = "-"
     try:
         ts = datetime.datetime.strptime(ts_str, "%Y-%m-%dT%H:%M:%S%z")
     except ValueError:
@@ -716,6 +762,11 @@ PY
 
 # auto-heal 分支会自己记账，用它标记避免脚本末尾重复采样
 PROBE_DONE=0
+# auto-heal 已经确认「当前节点不可用」时置 1。
+# 它的唯一作用：禁止下面走「复用存活代理」的捷径 —— 见那一段的注释。
+HEAL_DOWN=0
+# 换节点之前的那个节点。全部换失败时用它回滚，避免「踢掉坏节点反而彻底断网」。
+PREV_NODE=""
 
 case "${1:-}" in
   health)
@@ -723,11 +774,16 @@ case "${1:-}" in
     exit 0
     ;;
   nodes)
+    # --current 必须是整数：还没选过节点时 current_node_id 返回 "-"，
+    # argparse 会直接报错，所以在这里退化成 0（0 永不等于任何行号）。
+    _cur="$(current_node_id)"
+    [[ "$_cur" =~ ^[0-9]+$ ]] || _cur=0
     "$PYTHON_BIN" "$NODE_STATS" report \
       --log "$HEALTH_LOG" \
       --window "$RANK_WINDOW" \
       --cooldown "$NODE_COOLDOWN" \
       --default-ratio "$DEFAULT_NODE_RATIO" \
+      --current "$_cur" \
       --total-lines "$(link_total_lines)"
     exit 0
     ;;
@@ -741,14 +797,15 @@ case "${1:-}" in
     # 这里默认要求连测 2 轮（比交互启动严），因为 cron 每分钟才给一次机会，
     # 误判成 UP 会白等一分钟。
     NODE_STABLE_ROUNDS="${NODE_STABLE_ROUNDS:-2}"
-    HEAL_OK="$(health_sample)"
-    log_health "$HEAL_OK"
-    if [[ "$HEAL_OK" == "1" ]]; then
-      printf '%s  UP    (node=%s)\n' "$(date '+%H:%M:%S')" "$(current_node_id)"
+    health_check_state
+    log_health "$HEALTH_OK" "$(current_node_id)" "$HEALTH_DIAG"
+    if [[ "$HEALTH_OK" == "1" ]]; then
+      printf '%s  UP    (node=%s)  %s\n' "$(date '+%H:%M:%S')" "$(current_node_id)" "$HEALTH_DIAG"
       exit 0
     fi
-    printf '%s  DOWN  (node=%s) — 触发自动重连\n' "$(date '+%H:%M:%S')" "$(current_node_id)"
-    vlog_file "auto-heal: DOWN node=$(current_node_id) — 触发自动重连"
+    printf '%s  DOWN  (node=%s)  %s — 触发自动重连\n' "$(date '+%H:%M:%S')" "$(current_node_id)" "$HEALTH_DIAG"
+    vlog_file "auto-heal: DOWN node=$(current_node_id) [${HEALTH_DIAG}] — 触发自动重连"
+    HEAL_DOWN=1
     PROBE_DONE=1
     ;;
   proxy-on)
@@ -787,9 +844,12 @@ case "${1:-}" in
 
 路径: 唯一根目录 \${VPN_HOME}(默认 \$HOME/vpn)，日志全在其下的 logs/
       logs/vpn.log 操作流水  logs/health.log 采样  logs/xray.log 进程输出
-logs/health.log 格式: <ISO8601> <1|0> <link.txt行号>
+logs/health.log 格式: <ISO8601> <1|0> <link.txt行号> [<失败明细>]
+      明细形如 google=000 或 google=204,youtube=403，用于定位抖动卡在哪一段；
+      0 的含义是「连续 \${HEALTH_CONFIRM_ROUNDS} 轮全部失败」= 确认不可用。
 策略参数可用环境变量覆盖：RANK_WINDOW=86400 NODE_COOLDOWN=3600 DEFAULT_NODE_RATIO=0.85
                          NODE_STABLE_ROUNDS=2 MAX_HEAL_SECONDS=180
+                         HEALTH_CONFIRM_ROUNDS=2 HEALTH_INTERVAL=60
 EOF
     exit 0
     ;;
@@ -814,8 +874,38 @@ fi
 
 resolve_xray_bin || exit 1
 
+# ── auto-heal 判定 DOWN：先停掉旧 xray，禁止复用 ────────────────────
+# 这是「冷却期名存实亡」的根因所在。
+#   旧的复用路径只看 check_node_stable（N 轮连测）：节点在抖动时，很可能是
+#   「采样那一刻不通 → 已经记了一条 0 → 复核的 2 轮又恰好都通」，
+#   于是脚本打印「代理已在运行」直接 exit 0，节点换都没换。
+#   结果就是 health.log 里它已经在冷却名单上躺着，实际却还在服务，
+#   而且每分钟继续往它头上刷 0 —— 报告说「冷却中」，日志说「还在用」。
+# 现在的约定很干脆：采样确认不可用 ⇒ 一律换节点，不再给「复用」开口子。
+if [[ "$HEAL_DOWN" == "1" ]]; then
+  PREV_NODE="$(current_node_id)"
+  if check_saved_xray_alive; then
+    _old_pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+    vlog "auto-heal 已确认不可用 [${HEALTH_DIAG}] → 停掉旧 xray (pid=${_old_pid:-?}) 重新选节点"
+    kill "$_old_pid" 2>/dev/null || true
+    rm -f "$PID_FILE"
+  fi
+  # 等端口真正释放（SIGTERM 到内核回收有几十毫秒到数秒的窗口）。
+  # 只等 5s：等不到就交给下一分钟的 cron，绝不在这里无限期挂着。
+  _wait=0
+  while check_port_listening "$HTTP_PORT" && [[ "$_wait" -lt 5 ]]; do
+    _wait=$((_wait + 1))
+    sleep 1
+  done
+  if check_port_listening "$HTTP_PORT"; then
+    vlog "端口 $HTTP_PORT 仍未释放（wait ${_wait}s），本分钟放弃，下一轮重试" >&2
+    exit 2
+  fi
+fi
+
 # Reuse a live local proxy only when real Google and YouTube traffic works.
-if check_port_listening "$HTTP_PORT" && check_saved_xray_alive; then
+# HEAL_DOWN=1 时整段跳过 —— 上面的约定不允许「确认坏了还接着用」。
+if [[ "$HEAL_DOWN" != "1" ]] && check_port_listening "$HTTP_PORT" && check_saved_xray_alive; then
   if ! check_node_stable; then
     vlog "代理本地端口在监听但上游不通，重启 xray"
     kill "$(cat "$PID_FILE")" 2>/dev/null || true
@@ -969,7 +1059,7 @@ fast_ping_nodes() {
     vlog "已达自愈时长上限，跳过第 2 轮" >&2
     return 1
   fi
-  try_ranked_list "$cand" "第 2 轮：放开 TCP / 冷却限制兜底" "--ignore-cooldown" && return 0
+  try_ranked_list "$cand" "第 2 轮：兜底——放开 TCP 限制，冷却中的节点排到最后" "--ignore-cooldown" && return 0
 
   return 1
 }
@@ -993,24 +1083,30 @@ if [[ -n "${2:-}" ]]; then
     exit 3
   fi
 else
-  # 自动选节点：ping 预筛 → 历史可用率排序 → 冷却过滤
+  # 自动选节点：TCP 预筛 → 历史可用率排序 → 冷却过滤
   if fast_ping_nodes; then
     print_success
     exit 0
   fi
 
-  # 兜底：全量候选（不限 TCP 结果、忽略冷却）按历史可用率再扫一轮。
-  # 只在 fast_ping_nodes 提前退出（预筛没产出文件 / 超时）时才有实际作用；
-  # TRIED 是同一个变量，已经试过并失败的节点不会被重复尝试。
-  vlog "前两轮未成功，改为全量候选再扫一轮..." >&2
-  cand_file="$(mktemp)"
-  list_candidate_lines > "$cand_file"
-  if try_ranked_list "$cand_file" "第 3 轮：全量候选 + 忽略冷却" "--ignore-cooldown"; then
-    rm -f "$cand_file"
-    print_success
-    exit 0
+  # 原先这里还有「第 3 轮：全量候选 + 忽略冷却」。它和第 2 轮的候选集合
+  # 完全等价（node_probe.py list 与 scan 产出的 candidates.txt 是同一批
+  # 非香港可解析行），而 TRIED 会记住已失败的节点，所以那一轮实际什么新节点
+  # 都试不到 —— 已删掉，换成下面真正有价值的回滚。
+
+  # ── 回滚：换节点全军覆没时，宁可「将就用旧节点」也不要彻底断网 ──
+  # 只在 auto-heal 强制换节点、且原节点可寻址时才有意义。
+  # 这里刻意给 30s 预算：一旦某轮把 heal_expired 拖到界外，try_node 会直接
+  # 拒跑，回滚就白写了 —— 而回滚恰恰是最需要成功的那一次尝试。
+  if [[ "$HEAL_DOWN" == "1" ]] && [[ "$PREV_NODE" =~ ^[0-9]+$ ]]; then
+    vlog "换节点全部失败，回滚到原节点 ${PREV_NODE}（下一分钟再试）" >&2
+    TRIED=" "
+    HEAL_DEADLINE=$(( $(date +%s) + 30 ))
+    if try_node "$PREV_NODE"; then
+      print_success
+      exit 0
+    fi
   fi
-  rm -f "$cand_file"
 
   vlog "所有候选节点均失败，详见 $LOG_FILE" >&2
   exit 3

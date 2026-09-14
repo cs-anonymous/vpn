@@ -3,15 +3,17 @@
 
 数据源 health.log，每行格式：
 
-    <ISO8601 时间戳> <1|0> <link.txt 行号>
+    <ISO8601 时间戳> <1|0> <link.txt 行号> [<失败明细>]
 
 第 3 列永远是 **link.txt 的原始行号**，与 ``gen_xray_config.py --line``
 使用同一套编号。日志、选节点、命令行参数三者编号一致，不会错位。
+第 4 列是可选明细（如 ``google=000`` / ``google=204,youtube=403``），
+只用于排查抖动卡在哪一段，排序逻辑不读它；旧的三列行照样解析。
 
 子命令
 ------
 rank     按期望可用率降序列出候选节点（供 start_cli.sh 消费）
-report   人类可读的健康报告（含冷却状态）
+report   人类可读的健康报告（含冷却状态、当前使用标记）
 
 期望可用率的算法（贝叶斯平滑）
 ------------------------------
@@ -32,11 +34,15 @@ report   人类可读的健康报告（含冷却状态）
 节点「最近一次失败」距今不足 ``--cooldown``（默认 3600s）即视为冷却中，
 ``rank`` 默认直接剔除它，冷却期满才重新进入候选。
 
+注意：**冷却只管「还能不能参选」，管不了「已经在跑的那个」**。
+把正在使用的节点换掉是 start_cli.sh 的 auto-heal 的职责 —— 它一旦确认
+当前节点不可用就必须真换，不能因为复核探测侥幸通过就继续用。
+
 用法
 ----
     node_stats.py rank --log health.log --lines reachable.txt --format lines
     node_stats.py rank --lines reachable.txt --ignore-cooldown --format lines
-    node_stats.py report --log health.log
+    node_stats.py report --log health.log --current 49
 """
 
 from __future__ import annotations
@@ -173,8 +179,14 @@ def cmd_rank(args) -> int:
             continue
         ranked.append((line, ratio, samples, remaining))
 
-    # 期望可用率降序 → 冷却剩余少的优先 → 行号稳定排序
-    ranked.sort(key=lambda r: (-r[1], r[3], r[0]))
+    if args.ignore_cooldown:
+        # 兜底轮：冷却中的节点被放回来了，此时「谁最该先用」不再看历史分数，
+        # 而是看谁离解除冷却最近 —— 刚失败 1 分钟的节点排在只剩 1 分钟的后面。
+        # 否则 ratio 会被 92% 的老牌节点主导，把「刚挂掉的它」又顶到队首。
+        ranked.sort(key=lambda r: (r[3], -r[1], r[0]))
+    else:
+        # 常规轮：期望可用率降序 → 冷却剩余少的优先 → 行号稳定排序
+        ranked.sort(key=lambda r: (-r[1], r[3], r[0]))
 
     for line, ratio, samples, _remaining in ranked:
         if args.format == "lines":
@@ -212,6 +224,7 @@ def cmd_report(args) -> int:
     print(header)
     print("-" * len(header))
 
+    current_stat = None
     for line, ratio, samples, remaining, stat in ranked:
         lifetime = (f"{100 * stat['up'] / stat['total']:.0f}%"
                     if stat["total"] else "-")
@@ -223,6 +236,9 @@ def cmd_report(args) -> int:
             state = "未探测"
         else:
             state = "可用"
+        if line == args.current:
+            current_stat = (line, ratio, remaining)
+            state = f"{state}  ← 当前使用"
         bar = "#" * round(ratio * 16)
         print(f"{line:>5}  {ratio * 100:9.1f}%  {samples:>8}  {lifetime:>8}  "
               f"{fail_ago:>8}  {state:<22} {bar}")
@@ -230,6 +246,15 @@ def cmd_report(args) -> int:
     cool = sum(1 for *_, remaining, _ in ranked if remaining > 0)
     print()
     print(f"合计 {len(ranked)} 个节点，其中 {cool} 个处于冷却中")
+
+    # 「报告说冷却中、日志说还在用」是历史遗留的自相矛盾状态，现在不该再出现；
+    # 一旦出现就说明 auto-heal 的换节点路径没走通，必须显式喊出来。
+    if current_stat and current_stat[2] > 0:
+        print()
+        print(f"⚠ 异常：当前正在使用的是 {current_stat[0]} 号节点，而它处于冷却中"
+              f"（{_fmt_ago(current_stat[2])} 后解除）")
+        print("  auto-heal 应当已经换掉它。检查 cron 是否在跑："
+              "sh install-cron.sh status")
 
     seen = {r[2] for r in rows}
     if args.total_lines:
@@ -262,13 +287,16 @@ def main(argv=None) -> int:
     add_common(r)
     r.add_argument("--lines", help="候选行号文件（默认用 health.log 里出现过的全部节点）")
     r.add_argument("--ignore-cooldown", action="store_true",
-                   help="忽略冷却（全部节点都被冷却时的兜底轮）")
+                   help="兜底轮：保留冷却中的节点，但按「冷却最早结束」优先排序"
+                        "（避免刚挂掉的节点因为是老牌高分又被顶到队首）")
     r.add_argument("--format", choices=("table", "lines"), default="table",
                    help="lines = 每行只打印行号，供 shell 直接消费")
     r.set_defaults(func=cmd_rank)
 
     rep = sub.add_parser("report", help="人类可读的节点健康报告")
     add_common(rep)
+    rep.add_argument("--current", type=int, default=0,
+                     help="当前正在使用的 link.txt 行号，用于标出「← 当前使用」")
     rep.add_argument("--total-lines", type=int, default=0,
                      help="link.txt 总行数，用于提示从未采样的节点数")
     rep.set_defaults(func=cmd_report)

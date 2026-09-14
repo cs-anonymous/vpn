@@ -61,7 +61,7 @@ VPN_HOME=/path/to/vpn bash start_cli.sh doctor
 | 文件 | 内容 | 大小 |
 | --- | --- | --- |
 | `logs/vpn.log` | **操作流水**：启动 / 换节点 / 自愈 / 代理开关。`start_cli.sh`、`stop_cli.sh` 共用一份 | 每次动作几行 |
-| `logs/health.log` | 每分钟一条 `<ISO8601> <1\|0> <link.txt 行号>` 采样 | 自动修剪到 20000 行 |
+| `logs/health.log` | 每分钟一条 `<ISO8601> <1\|0> <link.txt 行号> [<明细>]` 采样 | 自动修剪到 20000 行 |
 | `logs/cron.log` | cron 包装器运行日志，UP 每分钟一行、异常展开明细 | 512KB 后轮换为 `.1` |
 | `logs/xray.log` | xray 进程自身的 stdout/stderr，每次启动覆盖 | 小 |
 
@@ -152,7 +152,10 @@ cron 的运行环境和你的交互 shell 完全是两回事，实测踩到的�
 3. 依次尝试，第一个探测通过的节点即被采用。
 
 **第 2 轮**（兜底）
-放开 TCP 与冷却限制，按可用率重排后再扫一遍，避免「候选全在冷却中」时无节点可用。
+
+放开 TCP 限制、把冷却中的节点放回来，再扫一遍，避免「候选全在冷却中」时无节点可用。
+放回来的节点**按冷却剩余时间升序**排（而不是按历史分）—— 兜底时挑「离解除冷却最近」的，
+否则 92% 的老牌节点一进冷却就会被它的历史高分重新顶到队首。
 
 ### 策略 1 —— 按历史可用率排序，而非文件顺序
 
@@ -176,6 +179,34 @@ ratio = (窗口内 UP 数 + prior * k) / (窗口内样本数 + k)
 ### 策略 2 —— 失败冷却
 
 节点**最近一次失败**距今不足 `NODE_COOLDOWN`（默认 **3600s**）即视为冷却中，`rank` 直接剔除；冷却期满才重新进入候选。这是消除「在 1 号和 4 号之间反复横跳」的关键。
+
+#### 冷却只管「能不能参选」，换掉「正在跑的那个」是 auto-heal 的职责
+
+这是最容易踩空的一环：冷却名单是给**候选排序**用的，它天然碰不到**当前正在服务的那个节点**。
+把在跑的节点踢掉靠的是 `auto-heal`：它一旦判定当前节点不可用，就必须真的换。
+
+早期实现留了一条「复用存活代理」的捷径 —— 采样失败后，只要那一刻 `check_node_stable`
+（2 轮连测）侥幸通过，就打印「代理已在运行」直接 `exit 0`，节点根本没换。后果是：
+
+> `logs/health.log` 里这个节点已经在冷却名单上躺着，实际却还在服务，而且每分钟继续往它
+> 头上刷 `0`。`start_cli.sh nodes` 说「冷却中」，`health.log` 说「还在用」—— 自相矛盾。
+
+由于采样用 1 轮判定、复用复核用 2 轮判定，「记了失败但不换」是常态而非偶然：
+一个真实可用率 92% 的节点，每分钟左右就会出现一次「1 轮失败 + 接着 2 轮通过」的组合。
+
+现在两条约定锁死这件事：
+
+1. **`HEAL_DOWN=1` 禁止复用**：`auto-heal` 确认不可用后，先停掉旧 xray 再重选，绝不给复用开口子；
+2. **`0` 的含义收紧为「连续 `HEALTH_CONFIRM_ROUNDS` 轮全部失败」**（默认 2 轮）：
+   任一轮通过即记 `1`。单发探测在劣化线路上抖动极大，把「抖」写成「故障」会无谓地把好节点推进冷却。
+
+`auto-heal` 里 `NODE_STABLE_ROUNDS=2`、采样侧 `HEALTH_CONFIRM_ROUNDS=2`，两处判定方向一致（都趋严），不再互相打架。
+
+**换节点全军覆没时回滚**：若两轮候选全部失败，脚本退回换节点之前的那个节点
+（`PREV_NODE`），宁可「将就用旧节点」也不彻底断网，下一分钟再试。日志记为「回滚到原节点 N」。
+
+调试用：`start_cli.sh nodes` 会把当前正在使用的节点标成 `← 当前使用`；一旦它处于冷却中，
+报告末尾会直接打出 `⚠ 异常：当前正在使用的是 N 号节点，而它处于冷却中` —— 正常实现下不该出现。
 
 ### 策略 3 —— 香港节点过滤
 
@@ -204,7 +235,7 @@ ratio = (窗口内 UP 数 + prior * k) / (窗口内样本数 + k)
 | --- | --- |
 | `bash start_cli.sh [端口] [行号]` | 启动或复用代理（默认 7890） |
 | `bash start_cli.sh doctor` | 环境自检 |
-| `bash start_cli.sh nodes` | 各节点健康报告：期望可用率 / 窗口样本 / 全历史 / 最近失败 / 冷却状态 |
+| `bash start_cli.sh nodes` | 各节点健康报告：期望可用率 / 窗口样本 / 全历史 / 最近失败 / 冷却状态，并标出 `← 当前使用` |
 | `bash start_cli.sh health` | 整体 UP ratio 报告（总体 / 1h / 24h / 逐小时） |
 | `bash start_cli.sh auto-heal` | **采样 + 断线自动换节点重连**（cron 每分钟调这个） |
 | `bash start_cli.sh health-probe` | 采样一次并记账，纯采集不做恢复 |
@@ -214,13 +245,15 @@ ratio = (窗口内 UP 数 + prior * k) / (窗口内样本数 + k)
 | `sh install-cron.sh` | 幂等写入 / 移除 crontab 托管段 |
 | `python3 node_probe.py scan --out-dir D` | TCP 可达性预筛 |
 | `python3 node_stats.py rank --lines F --format lines` | 输出排好序的行号，供脚本消费 |
+| `python3 node_stats.py report --current N` | 健康报告，`--current` 标出正在使用的节点 |
 | `python3 gen_xray_config.py --links link.txt --line 50 --out ... --selected ...` | 按行号生成配置 |
 
 策略参数可用环境变量覆盖：
 
 ```bash
 RANK_WINDOW=86400 NODE_COOLDOWN=3600 DEFAULT_NODE_RATIO=0.85 \
-NODE_STABLE_ROUNDS=2 MAX_HEAL_SECONDS=180 bash start_cli.sh
+NODE_STABLE_ROUNDS=2 MAX_HEAL_SECONDS=180 \
+HEALTH_CONFIRM_ROUNDS=2 HEALTH_INTERVAL=60 bash start_cli.sh
 ```
 
 cron 不继承 shell 环境，要改这些值就写进 crontab 的环境行（放在托管段里即可）。
@@ -230,14 +263,21 @@ cron 不继承 shell 环境，要改这些值就写进 crontab 的环境行（�
 ## logs/health.log 格式
 
 ```
-<ISO8601 时间戳> <1|0> <link.txt 行号>
-2026-09-14T18:47:02+0800 1 5
+<ISO8601 时间戳> <1|0> <link.txt 行号> [<探测明细>]
+2026-09-14T18:47:02+0800 1 5 google=204,youtube=200
+2026-09-14T18:47:02+0800 0 5 google=000
 ```
 
 第 3 列**永远是 link.txt 的原始行号**，与 `--line` 参数、`node_stats.py` 的排名共用同一套编号。
+第 4 列是可选明细（`google=204,youtube=403` 这类），用来定位抖动到底卡在哪一段；排序逻辑不读它，
+旧的三列行照样解析。`port-closed` 表示 xray 本地端口都没在监听。
+
+`0` 的含义是**连续 `HEALTH_CONFIRM_ROUNDS`（默认 2）轮全部失败 = 确认不可用**，
+不是「这一秒抖了一下」。任一轮通过即记 `1`。
 
 ```bash
 awk '{print $2}' logs/health.log     # 原始 1/0 序列
+awk '$2=="0"{print $4}' logs/health.log | sort | uniq -c | sort -rn   # 失败都卡在哪
 bash start_cli.sh nodes              # 按节点汇总
 ```
 
