@@ -376,17 +376,23 @@ proxy_status() {
 #   老格式（只有 2 列）报告里仍兼容解析为 node="-"
 HEALTH_INTERVAL="${HEALTH_INTERVAL:-60}"
 # 采样确认轮数：一次 curl 探测在劣化线路上抖动极大，单发失败就记账会把「抖」
-# 写成「故障」，进而把好节点推进冷却名单 —— 而它其实还在服务（见下方 auto-heal）。
+# 写成「故障」，进而给好节点扣掉本不该扣的分 —— 而它其实还在服务（见下方 auto-heal）。
 # 规则：任一轮通过即记 1；全部轮次失败才记 0。0 从此等价于「确认不可用」。
 HEALTH_CONFIRM_ROUNDS="${HEALTH_CONFIRM_ROUNDS:-2}"
 
 # ── 选节点策略参数 ─────────────────────────────────────────────────
-# 策略 1：候选节点按 health.log 的历史期望可用率降序尝试，不再按 link.txt 顺序，
-#         可用率低的节点自然排到最后（node_stats.py rank 负责算）。
-# 策略 2：最近一次失败距今 < NODE_COOLDOWN 的节点直接排除，冷却期满才重新参选。
-RANK_WINDOW="${RANK_WINDOW:-86400}"               # 排序统计窗口：24h
-NODE_COOLDOWN="${NODE_COOLDOWN:-3600}"            # 失败冷却：1h
-DEFAULT_NODE_RATIO="${DEFAULT_NODE_RATIO:-0.85}"  # 未探测节点的先验可用率
+# 候选顺序完全由 node_stats.py 的**单一评分函数**决定（不再按 link.txt 顺序）：
+#
+#     可用率 = (U + 先验*K) / (U + D + K)     U/D = 按年龄衰减加权的成功/失败证据
+#     折扣   = 1 - 失败折扣 * 0.5 ^ (距最近一次失败 / 失败半衰期)
+#     评分   = 可用率 * 折扣
+#
+# 「按历史可用率排序」和「失败后先别用一阵子」是同一条公式的两个因子 ——
+# 没有窗口、没有样本数阈值、没有冷却名单，也就没有可以互相打架的两套判定。
+SCORE_HALF_LIFE="${SCORE_HALF_LIFE:-86400}"       # 成绩记多久：24h
+FAIL_HALF_LIFE="${FAIL_HALF_LIFE:-1800}"          # 失败折扣多久消退：30min
+FAIL_DISCOUNT="${FAIL_DISCOUNT:-0.5}"             # 刚失败时分数打五折
+DEFAULT_NODE_RATIO="${DEFAULT_NODE_RATIO:-0.85}"  # 未探测节点的先验评分
 # 单次自愈的总时长上限。cron 每分钟触发一次，坏节点太多时一次尝试可能拖很久，
 # 后续触发会被单实例锁挡在门外（这是有意的），但也不能无限期拖着。
 MAX_HEAL_SECONDS="${MAX_HEAL_SECONDS:-180}"
@@ -813,8 +819,9 @@ case "${1:-}" in
     [[ "$_cur" =~ ^[0-9]+$ ]] || _cur=0
     "$PYTHON_BIN" "$NODE_STATS" report \
       --log "$HEALTH_LOG" \
-      --window "$RANK_WINDOW" \
-      --cooldown "$NODE_COOLDOWN" \
+      --score-half-life "$SCORE_HALF_LIFE" \
+      --fail-half-life "$FAIL_HALF_LIFE" \
+      --fail-discount "$FAIL_DISCOUNT" \
       --default-ratio "$DEFAULT_NODE_RATIO" \
       --current "$_cur" \
       --total-lines "$(link_total_lines)"
@@ -866,8 +873,8 @@ case "${1:-}" in
 用法:
   bash start_cli.sh [端口] [link.txt行号]  启动/复用代理(默认 7890)
      第 2 个参数是 link.txt 的行号(1-based)，与 health.log 第 3 列同一套编号。
-     省略则自动选：TCP 可达 + 未冷却 + 历史可用率最高的节点。
-  bash start_cli.sh nodes                 各节点健康报告(期望可用率 / 冷却状态)
+     省略则自动选：TCP 可达 + 综合评分最高的节点。
+  bash start_cli.sh nodes                 各节点健康报告(评分 / 扣分 / 样本)
   bash start_cli.sh health                整体 UP ratio 报告
   bash start_cli.sh health-probe          采样一次并追加 1/0 到 health.log(纯记账)
   bash start_cli.sh auto-heal             采样 + 断线时自动换节点重连(定时任务用)
@@ -882,8 +889,8 @@ logs/health.log 格式: <ISO8601> <1|0> <link.txt行号> [<失败明细>]
       0 的含义是「连续 \${HEALTH_CONFIRM_ROUNDS} 轮全部失败」= 确认不可用。
       一次运行写 1~2 条：先记「开始时当前节点是否可用」；若它是 0，
       脚本换了节点并启动成功，会为新节点再补 1 条。
-策略参数可用环境变量覆盖：RANK_WINDOW=86400 NODE_COOLDOWN=3600 DEFAULT_NODE_RATIO=0.85
-                         NODE_STABLE_ROUNDS=2 MAX_HEAL_SECONDS=180
+策略参数可用环境变量覆盖：SCORE_HALF_LIFE=86400 FAIL_HALF_LIFE=1800 FAIL_DISCOUNT=0.5
+                         DEFAULT_NODE_RATIO=0.85 NODE_STABLE_ROUNDS=2 MAX_HEAL_SECONDS=180
                          HEALTH_CONFIRM_ROUNDS=2 HEALTH_INTERVAL=60
 EOF
     exit 0
@@ -910,12 +917,12 @@ fi
 resolve_xray_bin || exit 1
 
 # ── auto-heal 判定 DOWN：先停掉旧 xray，禁止复用 ────────────────────
-# 这是「冷却期名存实亡」的根因所在。
+# 这是「扣了分却还在服役」的根因所在。
 #   旧的复用路径只看 check_node_stable（N 轮连测）：节点在抖动时，很可能是
 #   「采样那一刻不通 → 已经记了一条 0 → 复核的 2 轮又恰好都通」，
 #   于是脚本打印「代理已在运行」直接 exit 0，节点换都没换。
-#   结果就是 health.log 里它已经在冷却名单上躺着，实际却还在服务，
-#   而且每分钟继续往它头上刷 0 —— 报告说「冷却中」，日志说「还在用」。
+#   结果就是 health.log 里它已经被扣了分、评分沉到队尾，实际却还在服务，
+#   而且每分钟继续往它头上刷 0。
 # 现在的约定很干脆：采样确认不可用 ⇒ 一律换节点，不再给「复用」开口子。
 if [[ "$HEAL_DOWN" == "1" ]]; then
   PREV_NODE="$(current_node_id)"
@@ -975,16 +982,17 @@ list_candidate_lines() {
   "$PYTHON_BIN" "$PROBE_SCRIPT" list --links "$LINK_FILE"
 }
 
-# 策略 1 + 策略 2 的落点：把候选丢给 node_stats.py，
-# 返回「按期望可用率降序、且剔除了冷却中节点」的行号列表。
-# 额外参数（如 --ignore-cooldown）会原样透传。
+# 排序落点：把候选丢给 node_stats.py，返回按综合评分降序的行号列表。
+# 评分是一条连续公式（时间衰减 + 失败扣分），所以候选永远是**全量**，
+# 不存在「被规则剔除」的节点，也没有需要透传的第二套参数。
 rank_candidates() {
   local candidate_file="$1"; shift
   "$PYTHON_BIN" "$NODE_STATS" rank \
     --log "$HEALTH_LOG" \
     --lines "$candidate_file" \
-    --window "$RANK_WINDOW" \
-    --cooldown "$NODE_COOLDOWN" \
+    --score-half-life "$SCORE_HALF_LIFE" \
+    --fail-half-life "$FAIL_HALF_LIFE" \
+    --fail-discount "$FAIL_DISCOUNT" \
     --default-ratio "$DEFAULT_NODE_RATIO" \
     --format lines "$@" 2>/dev/null
 }
@@ -1054,7 +1062,7 @@ try_node() {
 
 # 依次尝试一个排好序的行号文件，命中即返回 0。
 # 刻意不用数组也不用 mapfile —— bash 3.2（macOS 自带）没有 mapfile。
-# $2 是描述文本，$3 是透传给 node_stats.py rank 的额外参数（如 --ignore-cooldown）。
+# $2 是描述文本，$3 是透传给 node_stats.py rank 的额外参数（当前调用点都不传）。
 try_ranked_list() {
   local list_file="$1" label="$2" extra="${3:-}"
   local ranked_file n count
@@ -1069,6 +1077,12 @@ try_ranked_list() {
   while IFS= read -r n || [[ -n "$n" ]]; do
     [[ -n "$n" ]] || continue
     [[ "$TRIED" == *" $n "* ]] && continue
+    # 超时后 try_node 会立刻拒跑，继续遍历只会给每个候选刷一条 FAIL 噪声。
+    # 在这里直接收工，把这一分钟剩下的时间还给 cron。
+    if heal_expired; then
+      vlog "已达自愈时长上限，放弃剩余候选（交给下一分钟）"
+      break
+    fi
     if try_node "$n"; then
       vlog "  link.txt 第 ${n} 行 → OK"
       rm -f "$ranked_file"
@@ -1083,8 +1097,10 @@ try_ranked_list() {
 }
 
 # 预筛 + 排序后依次尝试（函数名沿用了历史的 fast_ping_nodes）。
-#   第 1 轮：TCP 可达 且 未冷却，按期望可用率降序 —— 策略 1 + 策略 2
-#   第 2 轮：放开 TCP 与冷却限制兜底，避免「候选全在冷却中」时无节点可用
+#   第 1 轮：TCP 可达的候选，按综合评分降序（评分见文件头部「选节点策略参数」）
+#   第 2 轮：放开 TCP 预筛、用全量候选兜底 —— 防的是预筛本身误杀（扫描时瞬时抖动）。
+#            刚失败的节点不需要单独的「冷却名单」来压后，评分函数已经按
+#            「失败有多新」扣掉了相应分数，它自己就会排到队尾。
 #
 # 预筛为什么不是 ICMP ping：macOS 的 `ping -W` 是毫秒、Linux 是秒，
 # Linux 的 `-t` 是 TTL 而 macOS 的 `-t` 才是总超时，同一行命令无法两边都对；
@@ -1110,13 +1126,13 @@ fast_ping_nodes() {
 
   TRIED=" "
   if [[ -s "$reach" ]]; then
-    try_ranked_list "$reach" "第 1 轮：TCP 可达 + 未冷却 + 历史可用率降序" && return 0
+    try_ranked_list "$reach" "按综合评分降序（TCP 可达候选）" && return 0
   fi
   if heal_expired; then
-    vlog "已达自愈时长上限，跳过第 2 轮" >&2
+    vlog "已达自愈时长上限，跳过兜底轮" >&2
     return 1
   fi
-  try_ranked_list "$cand" "第 2 轮：兜底——放开 TCP 限制，冷却中的节点排到最后" "--ignore-cooldown" && return 0
+  try_ranked_list "$cand" "兜底轮：放开 TCP 预筛，全量候选再扫一遍" && return 0
 
   return 1
 }
@@ -1143,16 +1159,16 @@ if [[ -n "${2:-}" ]]; then
     exit 3
   fi
 else
-  # 自动选节点：TCP 预筛 → 历史可用率排序 → 冷却过滤
+  # 自动选节点：TCP 预筛 → 综合评分排序 → 依次尝试
   if fast_ping_nodes; then
     print_success
     exit 0
   fi
 
-  # 原先这里还有「第 3 轮：全量候选 + 忽略冷却」。它和第 2 轮的候选集合
-  # 完全等价（node_probe.py list 与 scan 产出的 candidates.txt 是同一批
-  # 非香港可解析行），而 TRIED 会记住已失败的节点，所以那一轮实际什么新节点
-  # 都试不到 —— 已删掉，换成下面真正有价值的回滚。
+  # 原先这里还有「第 3 轮：全量候选 + 忽略冷却」。它和兜底轮的候选集合完全等价
+  # （node_probe.py list 与 scan 产出的 candidates.txt 是同一批非香港可解析行），
+  # 而 TRIED 会记住已失败的节点，所以那一轮实际什么新节点都试不到 ——
+  # 已删掉，换成下面真正有价值的回滚。
 
   # ── 回滚：换节点全军覆没时，宁可「将就用旧节点」也不要彻底断网 ──
   # 只在 auto-heal 强制换节点、且原节点可寻址时才有意义。

@@ -12,37 +12,70 @@
 
 子命令
 ------
-rank     按期望可用率降序列出候选节点（供 start_cli.sh 消费）
-report   人类可读的健康报告（含冷却状态、当前使用标记）
+rank     按评分降序列出候选节点（供 start_cli.sh 消费）
+report   人类可读的健康报告（含当前使用标记）
 
-期望可用率的算法（贝叶斯平滑）
-------------------------------
-    ratio = (窗口内 UP 数 + prior * k) / (窗口内样本数 + k)
+评分：单一连续函数
+------------------
+    U      = Σ 0.5 ** (样本年龄 / H_score)      （UP 样本的加权和）
+    D      = Σ 0.5 ** (样本年龄 / H_score)      （DOWN 样本的加权和）
+    可用率 = (U + prior * K) / (U + D + K)
+    折扣   = 1 - β * 0.5 ** (距最近一次失败 / H_fail)
+    score  = 可用率 * 折扣
 
-* ``--window`` 决定统计窗口（默认 24h），反映节点**最近**的质量 ——
-  一个昨天 95%、今天 20% 的节点不会被历史高分掩盖。
-* 窗口内样本不足 k 条时回退到全历史样本再做平滑。
-* ``k`` = ``--min-samples``（默认 3）；``prior`` = ``--default-ratio``
-  （默认 0.85）。于是：
-    - 从没采样过的新节点      → 0.850（不会被排到最后，也压不过优质节点）
-    - 只采样 1 次且失败       → (0 + 0.85*3) / (1 + 3) = 0.638（不判死刑）
-    - 只采样 1 次且成功       → (1 + 0.85*3) / (1 + 3) = 0.888
-    - 24h 内 100/100 全成功   → 1.000
+**整个仓库只有这一条公式，没有任何分支。** 没有统计窗口、没有样本数阈值、
+没有被排除的节点名单。两个边界情况都自然退化，不需要特判：
 
-冷却（策略 2）
+* 从没采样过的节点 U = D = 0 → 可用率退化成 ``prior``；
+* 从没失败过的节点「距最近一次失败」取 ∞ → 折扣退化成 1。
+
+两个时间尺度各司其职
+--------------------
+* ``H_score``（``--score-half-life``，默认 24h）决定**成绩记多久**。
+  越新的样本越重，一天前的样本仍有分量 —— 节点的历史水平要慢慢才能被改写。
+  实测：8 号 638 条 99.4%（最近一条在 22.7h 前）得 0.978；
+  1 号全历史 73.5% 但最近一小时连续掉线，只剩 0.532。
+* ``H_fail``（``--fail-half-life``，默认 30min）决定**失败扣多久**。
+  这一项就是原策略 2「1 小时内失败过就先用别人」的连续版本：
+  刚失败的节点折扣最大，之后按半衰期迅速回升。
+
+折扣 = 减掉的那部分分数：``β * 0.5 ** (Δt / H_fail) * 可用率``。
+失败越久远减得越少 —— Δt=0 减一半，Δt=H_fail 减到四分之一，Δt=4·H_fail 只减 3%。
+以可用率 0.95 的节点为例：
+
+| 距最近一次失败 | 0 | 15m | 30m | 1h | 1.5h | 2h | 3h |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| score | .475 | .614 | .713 | .831 | .891 | .920 | .943 |
+
+未探测节点的先验是 0.850：所以刚失败的节点会沉到它下面（≈1h 后追平、2h 后反超），
+但它**不会被硬性剔除** —— 没有「冷却名单」这种东西，只有一条会自己爬回来的曲线。
+
+为什么不再分段
 --------------
-节点「最近一次失败」距今不足 ``--cooldown``（默认 3600s）即视为冷却中，
-``rank`` 默认直接剔除它，冷却期满才重新进入候选。
+早期实现是 ``if 窗口样本 >= k: 用窗口频率 else: 回退全历史再平滑``，
+外加一条「最近一次失败 < 1h 直接剔除」的硬冷却。实测复现出两个后果：
 
-注意：**冷却只管「还能不能参选」，管不了「已经在跑的那个」**。
-把正在使用的节点换掉是 start_cli.sh 的 auto-heal 的职责 —— 它一旦确认
-当前节点不可用就必须真换，不能因为复核探测侥幸通过就继续用。
+1. **阈值断裂**：窗口 2 条全失败 → 0.977；窗口 3 条全失败 → 0.000，
+   只多一条样本落差 0.977 —— 这不是平滑，是断崖。
+2. **排序倒挂**：窗口 4 条里成功 2 条（真实 50%）→ 0.500，反而低于
+   「只采样 1 次且失败」（真实 0%）的 0.637 —— 两种量纲混在同一张表里排序。
+
+现在「按历史可用率排序」和「失败后先别用一阵子」不是两套机制、两条判定，
+而是同一条公式的两个因子 —— 于是也不会再出现「一个说冷却中、另一个说还在用」
+那种自相矛盾的状态。
+
+参数怎么调
+----------
+    SCORE_HALF_LIFE  成绩记忆：调大 → 更看重长期表现，调小 → 更快遗忘旧成绩
+    FAIL_HALF_LIFE   失败扣分的消退速度：调小 → 更快原谅
+    FAIL_DISCOUNT    刚失败时打几折：0 = 完全不惩罚，1 = 直接扣光
+    DEFAULT_NODE_RATIO  未探测节点的先验评分（默认 0.85，略低于健康节点）
 
 用法
 ----
     node_stats.py rank --log health.log --lines reachable.txt --format lines
-    node_stats.py rank --lines reachable.txt --ignore-cooldown --format lines
     node_stats.py report --log health.log --current 49
+    node_stats.py rank --fail-half-life 900 --fail-discount 0.7 --format lines
 """
 
 from __future__ import annotations
@@ -58,10 +91,11 @@ import sys
 VPN_HOME = pathlib.Path(os.environ.get("VPN_HOME") or (pathlib.Path.home() / "vpn"))
 DEFAULT_HEALTH_LOG = VPN_HOME / "logs" / "health.log"
 
-DEFAULT_WINDOW_SECONDS = 24 * 3600
-DEFAULT_COOLDOWN_SECONDS = 3600  # 1 小时
-DEFAULT_MIN_SAMPLES = 3
-DEFAULT_RATIO = 0.85
+DEFAULT_SCORE_HALF_LIFE = 24 * 3600  # 成绩证据的半衰期：24h
+DEFAULT_FAIL_HALF_LIFE = 1800        # 失败折扣的半衰期：30min
+DEFAULT_FAIL_DISCOUNT = 0.5          # 刚失败时分数打五折
+DEFAULT_PRIOR_WEIGHT = 20.0          # 先验相当于几条样本的分量
+DEFAULT_RATIO = 0.85                 # 未探测节点的先验评分
 TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%S%z"
 
 
@@ -92,54 +126,93 @@ def read_health_log(path) -> list[tuple[datetime.datetime, int, int]]:
     return rows
 
 
-def build_stats(rows, now, window_seconds):
-    """聚合出每个节点的统计字典，键为 link.txt 行号。"""
-    cut = now - datetime.timedelta(seconds=window_seconds)
+def decay_weight(age_seconds: float, half_life: float) -> float:
+    """样本的计权：刚采的记 1，过了 ``half_life`` 记 0.5，以此类推。
+
+    计时器回拨导致 age 为负时按「最新鲜」处理（记 1），不去惩罚时钟跳变。
+    """
+    if age_seconds <= 0:
+        return 1.0
+    return 0.5 ** (age_seconds / half_life)
+
+
+def build_stats(rows, now, half_life: float = DEFAULT_SCORE_HALF_LIFE):
+    """聚合出每个节点的统计字典，键为 link.txt 行号。
+
+    这里不再切窗口，而是给每条样本按年龄加权后累加 ——「窗口」这个概念被
+    衰减曲线取代了：一条刚采的 UP 和一条 24h 前的 UP，权重相差 2**28 倍。
+    """
     stats: dict[int, dict] = {}
 
     for ts, ok, line in rows:
         s = stats.get(line)
         if s is None:
             s = stats[line] = {
-                "total": 0,
+                "up_weight": 0.0,
+                "down_weight": 0.0,
                 "up": 0,
-                "window_total": 0,
-                "window_up": 0,
+                "down": 0,
+                "total": 0,
                 "first_seen": ts,
                 "last_seen": ts,
                 "last_ok": None,
                 "last_fail": None,
             }
+        w = decay_weight((now - ts).total_seconds(), half_life)
         s["total"] += 1
-        s["up"] += ok
         s["last_seen"] = ts
         if ok:
+            s["up"] += 1
+            s["up_weight"] += w
             s["last_ok"] = ts
         else:
+            s["down"] += 1
+            s["down_weight"] += w
             s["last_fail"] = ts  # rows 已按时间升序 → 最后一次赋值即最近失败
-        if ts >= cut:
-            s["window_total"] += 1
-            s["window_up"] += ok
 
     return stats
 
 
-def expected_ratio(stat, prior: float = DEFAULT_RATIO, k: int = DEFAULT_MIN_SAMPLES):
-    """返回 ``(期望可用率, 用于统计的样本数)``。stat 为 None 表示从未采样。"""
-    if stat is None:
-        return prior, 0
-    if stat["window_total"] >= k:
-        return stat["window_up"] / stat["window_total"], stat["window_total"]
-    total, up = stat["total"], stat["up"]
-    return (up + prior * k) / (total + k), total
+def fail_discount_factor(stat, now, fail_half_life: float = DEFAULT_FAIL_HALF_LIFE,
+                         fail_discount: float = DEFAULT_FAIL_DISCOUNT) -> float:
+    """失败折扣系数 ∈ ``[1-β, 1]``：1 = 没有近期失败；越小 = 刚失败扣得越狠。
+
+    从没失败过的节点，「距最近一次失败」取 ∞ → ``0.5 ** inf == 0`` → 系数回到 1。
+    这是公式自带的极限，所以这里不需要 ``if`` 分支。
+    """
+    age = float("inf")
+    if stat is not None and stat["last_fail"] is not None:
+        age = max(0.0, (now - stat["last_fail"]).total_seconds())
+    return 1.0 - fail_discount * (0.5 ** (age / fail_half_life))
 
 
-def cooldown_remaining(stat, now, cooldown_seconds: int) -> float:
-    """距冷却解除还有多少秒；0 表示不在冷却中。"""
+def node_score(stat, now, prior: float = DEFAULT_RATIO,
+               prior_weight: float = DEFAULT_PRIOR_WEIGHT,
+               fail_half_life: float = DEFAULT_FAIL_HALF_LIFE,
+               fail_discount: float = DEFAULT_FAIL_DISCOUNT) -> float:
+    """节点评分 —— 全仓库唯一的排序依据。
+
+        score = 可用率 * 折扣
+              = (U + prior*K) / (U + D + K) * (1 - β * 0.5 ** (Δt / H_fail))
+
+    ``stat`` 为 None（从未采样）时 U = D = 0，可用率退化成 ``prior``；
+    从未失败时折扣为 1。两处都是公式的自然极限，没有分支。
+    """
+    up_w = stat["up_weight"] if stat else 0.0
+    down_w = stat["down_weight"] if stat else 0.0
+    rate = (up_w + prior * prior_weight) / (up_w + down_w + prior_weight)
+    return rate * fail_discount_factor(stat, now, fail_half_life, fail_discount)
+
+
+def recent_down(stat) -> bool:
+    """这个节点的**最后一条**样本是不是失败。
+
+    用于报告里标出「它在扣分」。注意这不是排序条件，只是一个显示口径 ——
+    真正影响排序的永远是 ``node_score`` 的连续数值。
+    """
     if not stat or stat["last_fail"] is None:
-        return 0.0
-    elapsed = (now - stat["last_fail"]).total_seconds()
-    return max(0.0, cooldown_seconds - elapsed)
+        return False
+    return stat["last_ok"] is None or stat["last_fail"] > stat["last_ok"]
 
 
 def load_candidate_lines(path) -> list[int]:
@@ -160,39 +233,33 @@ def _fmt_ago(delta_seconds: float) -> str:
     return f"{delta_seconds / 86400:.1f}d"
 
 
+def _score_kwargs(args) -> dict:
+    return {"prior": args.default_ratio,
+            "prior_weight": args.prior_weight,
+            "fail_half_life": args.fail_half_life,
+            "fail_discount": args.fail_discount}
+
+
 def cmd_rank(args) -> int:
     now = datetime.datetime.now().astimezone()
     rows = read_health_log(args.log)
-    stats = build_stats(rows, now, args.window)
+    stats = build_stats(rows, now, args.score_half_life)
 
     if args.lines:
         candidates = load_candidate_lines(args.lines)
     else:
         candidates = sorted(stats)
 
-    ranked = []
-    for line in candidates:
-        stat = stats.get(line)
-        ratio, samples = expected_ratio(stat, args.default_ratio, args.min_samples)
-        remaining = cooldown_remaining(stat, now, args.cooldown)
-        if remaining > 0 and not args.ignore_cooldown:
-            continue
-        ranked.append((line, ratio, samples, remaining))
+    kw = _score_kwargs(args)
+    ranked = [(line, node_score(stats.get(line), now, **kw)) for line in candidates]
+    # 评分降序 → 行号升序做稳定 tie-break（同分时靠前的行号优先）
+    ranked.sort(key=lambda r: (-r[1], r[0]))
 
-    if args.ignore_cooldown:
-        # 兜底轮：冷却中的节点被放回来了，此时「谁最该先用」不再看历史分数，
-        # 而是看谁离解除冷却最近 —— 刚失败 1 分钟的节点排在只剩 1 分钟的后面。
-        # 否则 ratio 会被 92% 的老牌节点主导，把「刚挂掉的它」又顶到队首。
-        ranked.sort(key=lambda r: (r[3], -r[1], r[0]))
-    else:
-        # 常规轮：期望可用率降序 → 冷却剩余少的优先 → 行号稳定排序
-        ranked.sort(key=lambda r: (-r[1], r[3], r[0]))
-
-    for line, ratio, samples, _remaining in ranked:
+    for line, score in ranked:
         if args.format == "lines":
             print(line)
         else:
-            print(f"{line}\t{ratio:.3f}\t{samples}")
+            print(f"{line}\t{score:.3f}")
 
     return 0
 
@@ -204,64 +271,71 @@ def cmd_report(args) -> int:
         print(f"health.log 没有可用样本：{args.log}")
         return 0
 
-    stats = build_stats(rows, now, args.window)
+    stats = build_stats(rows, now, args.score_half_life)
+    kw = _score_kwargs(args)
 
     print(f"日志  {args.log}   ({len(rows)} 条带节点号的样本)")
     print(f"当前  {now:%Y-%m-%d %H:%M:%S}")
-    print(f"参数  窗口={args.window / 3600:.1f}h  冷却={args.cooldown / 60:.0f}min  "
-          f"样本下限={args.min_samples}  新节点先验={args.default_ratio:.2f}")
+    print(f"参数  成绩半衰期={_fmt_ago(args.score_half_life)}  "
+          f"失败折扣={args.fail_discount:g}（半衰期 {_fmt_ago(args.fail_half_life)}）  "
+          f"先验={args.default_ratio:.2f}（权重 {args.prior_weight:g} 条）")
+    print("      评分 = 可用率 × 折扣   —— "
+          "可用率=(U+先验*K)/(U+D+K)，折扣=1-失败折扣×0.5^(距最近失败/失败半衰期)")
     print()
 
-    ranked = []
-    for line, stat in stats.items():
-        ratio, samples = expected_ratio(stat, args.default_ratio, args.min_samples)
-        remaining = cooldown_remaining(stat, now, args.cooldown)
-        ranked.append((line, ratio, samples, remaining, stat))
-    ranked.sort(key=lambda r: (-r[1], r[3], r[0]))
+    ranked = [(line, node_score(stat, now, **kw), stat) for line, stat in stats.items()]
+    ranked.sort(key=lambda r: (-r[1], r[0]))
 
-    header = (f"{'行号':>5}  {'期望可用率':>10}  {'窗口样本':>8}  "
-              f"{'全历史':>8}  {'最近失败':>8}  状态")
+    header = (f"{'行号':>5}  {'评分':>7}  {'可用率':>7}  {'折扣':>6}  "
+              f"{'有效UP':>8}  {'样本UP':>6}  {'样本DOWN':>8}  {'最近失败':>8}  状态")
     print(header)
     print("-" * len(header))
 
-    current_stat = None
-    for line, ratio, samples, remaining, stat in ranked:
-        lifetime = (f"{100 * stat['up'] / stat['total']:.0f}%"
-                    if stat["total"] else "-")
+    current = None
+    for line, score, stat in ranked:
+        factor = fail_discount_factor(stat, now, args.fail_half_life, args.fail_discount)
+        rate = score / factor if factor else score
         fail_ago = (_fmt_ago((now - stat["last_fail"]).total_seconds())
                     if stat["last_fail"] else "-")
-        if remaining > 0:
-            state = f"冷却中 {_fmt_ago(remaining)} 后重试"
-        elif stat["total"] == 0:
+        # 状态看的是**实际折扣**，不是「最后一笔是不是失败」—— 一个 2 天前失败过、
+        # 之后再没被采样的节点，折扣早已回到 1.000，不该被标成「刚失败」。
+        if stat["total"] == 0:
             state = "未探测"
+        elif factor < 0.99:
+            state = "打折中"
         else:
             state = "可用"
         if line == args.current:
-            current_stat = (line, ratio, remaining)
+            current = (line, stat, factor)
             state = f"{state}  ← 当前使用"
-        bar = "#" * round(ratio * 16)
-        print(f"{line:>5}  {ratio * 100:9.1f}%  {samples:>8}  {lifetime:>8}  "
-              f"{fail_ago:>8}  {state:<22} {bar}")
+        bar = "#" * round(score * 16)
+        print(f"{line:>5}  {score * 100:6.1f}%  {rate * 100:6.1f}%  {factor:>6.3f}  "
+              f"{stat['up_weight']:>8.2f}  {stat['up']:>6}  {stat['down']:>8}  "
+              f"{fail_ago:>8}  {state:<20} {bar}")
 
-    cool = sum(1 for *_, remaining, _ in ranked if remaining > 0)
+    discounted = sum(1 for _, _, s in ranked
+                     if fail_discount_factor(s, now, args.fail_half_life,
+                                             args.fail_discount) < 0.99)
     print()
-    print(f"合计 {len(ranked)} 个节点，其中 {cool} 个处于冷却中")
+    print(f"合计 {len(ranked)} 个节点，其中 {discounted} 个正在打折（折扣 < 0.99）")
 
-    # 「报告说冷却中、日志说还在用」是历史遗留的自相矛盾状态，现在不该再出现；
-    # 一旦出现就说明 auto-heal 的换节点路径没走通，必须显式喊出来。
-    if current_stat and current_stat[2] > 0:
+    # 「当前节点最后一笔是失败」两种可能：a) 换节点时所有候选都失败、回滚到它
+    # （正常，下一分钟再试）；b) auto-heal 压根没换掉它（异常）。
+    # 单看 health.log 分不出来，所以只提示、不武断。
+    if current and recent_down(current[1]):
+        ago = (now - current[1]["last_fail"]).total_seconds()
         print()
-        print(f"⚠ 异常：当前正在使用的是 {current_stat[0]} 号节点，而它处于冷却中"
-              f"（{_fmt_ago(current_stat[2])} 后解除）")
-        print("  auto-heal 应当已经换掉它。检查 cron 是否在跑："
-              "sh install-cron.sh status")
+        print(f"⚠ 当前正在使用的是 {current[0]} 号节点，而它最后一笔采样是失败"
+              f"（{_fmt_ago(ago)} 前）")
+        print("  若这是「候选全失败后回滚」属正常；否则说明换节点没走通，"
+              "检查 cron：sh install-cron.sh status")
 
     seen = {r[2] for r in rows}
     if args.total_lines:
         missing = args.total_lines - len(seen)
         if missing > 0:
-            print(f"另有 {missing} 个 link.txt 行号从未被采样（新节点将按 "
-                  f"{args.default_ratio:.2f} 的先验参与排序）")
+            print(f"另有 {missing} 个 link.txt 行号从未被采样（按先验 "
+                  f"{args.default_ratio:.2f} 参与排序，稳定排在健康节点之后）")
     return 0
 
 
@@ -274,21 +348,23 @@ def main(argv=None) -> int:
     def add_common(sp):
         sp.add_argument("--log", default=str(DEFAULT_HEALTH_LOG),
                         help="health.log 路径")
-        sp.add_argument("--window", type=int, default=DEFAULT_WINDOW_SECONDS,
-                        help=f"统计窗口秒数（默认 {DEFAULT_WINDOW_SECONDS}）")
-        sp.add_argument("--cooldown", type=int, default=DEFAULT_COOLDOWN_SECONDS,
-                        help=f"失败后冷却秒数（默认 {DEFAULT_COOLDOWN_SECONDS}）")
-        sp.add_argument("--min-samples", type=int, default=DEFAULT_MIN_SAMPLES,
-                        help=f"平滑常数 k（默认 {DEFAULT_MIN_SAMPLES}）")
+        sp.add_argument("--score-half-life", type=float,
+                        default=DEFAULT_SCORE_HALF_LIFE,
+                        help=f"成绩证据的半衰期秒数（默认 {DEFAULT_SCORE_HALF_LIFE}）")
+        sp.add_argument("--fail-half-life", type=float,
+                        default=DEFAULT_FAIL_HALF_LIFE,
+                        help=f"失败折扣的半衰期秒数（默认 {DEFAULT_FAIL_HALF_LIFE}）")
+        sp.add_argument("--fail-discount", type=float,
+                        default=DEFAULT_FAIL_DISCOUNT,
+                        help=f"刚失败时分数打几折（默认 {DEFAULT_FAIL_DISCOUNT:g}）")
+        sp.add_argument("--prior-weight", type=float, default=DEFAULT_PRIOR_WEIGHT,
+                        help=f"先验相当于几条样本（默认 {DEFAULT_PRIOR_WEIGHT:g}）")
         sp.add_argument("--default-ratio", type=float, default=DEFAULT_RATIO,
-                        help=f"新节点先验可用率（默认 {DEFAULT_RATIO}）")
+                        help=f"未探测节点的先验评分（默认 {DEFAULT_RATIO}）")
 
-    r = sub.add_parser("rank", help="按期望可用率降序输出候选节点")
+    r = sub.add_parser("rank", help="按评分降序输出候选节点")
     add_common(r)
     r.add_argument("--lines", help="候选行号文件（默认用 health.log 里出现过的全部节点）")
-    r.add_argument("--ignore-cooldown", action="store_true",
-                   help="兜底轮：保留冷却中的节点，但按「冷却最早结束」优先排序"
-                        "（避免刚挂掉的节点因为是老牌高分又被顶到队首）")
     r.add_argument("--format", choices=("table", "lines"), default="table",
                    help="lines = 每行只打印行号，供 shell 直接消费")
     r.set_defaults(func=cmd_rank)
