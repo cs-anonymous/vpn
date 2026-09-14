@@ -7,12 +7,13 @@
 #   Linux → gsettings（有桌面会话时）+ 生成 proxy.env（headless/cron 下可用）
 set -uo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# ── 唯一根目录：~/vpn（与 start_cli.sh 同一套规则）──────────────────
+VPN_HOME="${VPN_HOME:-$HOME/vpn}"
 
 case "${1:-status}" in
-  on)      exec bash "$SCRIPT_DIR/start_cli.sh" proxy-on ;;
-  off)     exec bash "$SCRIPT_DIR/start_cli.sh" proxy-off ;;
-  status)  exec bash "$SCRIPT_DIR/start_cli.sh" proxy-status ;;
+  on)      exec bash "$VPN_HOME/start_cli.sh" proxy-on ;;
+  off)     exec bash "$VPN_HOME/start_cli.sh" proxy-off ;;
+  status)  exec bash "$VPN_HOME/start_cli.sh" proxy-status ;;
   *)
     echo "用法: $0 {on|off|status}" >&2
     exit 1

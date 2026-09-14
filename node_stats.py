@@ -43,8 +43,14 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import os
 import pathlib
 import sys
+
+# ── 唯一根目录：~/vpn（与 start_cli.sh 同一套规则）─────────────────────
+# 日志统一在 $VPN_HOME/logs/ 下；VPN_HOME 可用环境变量覆盖。
+VPN_HOME = pathlib.Path(os.environ.get("VPN_HOME") or (pathlib.Path.home() / "vpn"))
+DEFAULT_HEALTH_LOG = VPN_HOME / "logs" / "health.log"
 
 DEFAULT_WINDOW_SECONDS = 24 * 3600
 DEFAULT_COOLDOWN_SECONDS = 3600  # 1 小时
@@ -241,7 +247,7 @@ def main(argv=None) -> int:
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     def add_common(sp):
-        sp.add_argument("--log", default=str(pathlib.Path.home() / "vpn" / "health.log"),
+        sp.add_argument("--log", default=str(DEFAULT_HEALTH_LOG),
                         help="health.log 路径")
         sp.add_argument("--window", type=int, default=DEFAULT_WINDOW_SECONDS,
                         help=f"统计窗口秒数（默认 {DEFAULT_WINDOW_SECONDS}）")

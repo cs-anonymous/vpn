@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import os
 import pathlib
 import socket
 import sys
@@ -39,6 +40,10 @@ from gen_xray_config import is_hongkong_url, parse_link  # noqa: E402
 
 DEFAULT_TIMEOUT = 3.0
 DEFAULT_WORKERS = 16
+
+# ── 唯一根目录：~/vpn（与 start_cli.sh 同一套规则）─────────────────────
+# VPN_HOME 可用环境变量覆盖；link.txt 默认就在根目录下。
+VPN_HOME = pathlib.Path(os.environ.get("VPN_HOME") or (pathlib.Path.home() / "vpn"))
 # TCP 握手成功即算可达。不在这里做「能不能翻墙」的判断 —— 那是 try_node
 # 的职责，本模块只负责用一秒钟把明显连不上的节点筛掉。
 DEFAULT_PORT_FALLBACK = 443
@@ -178,7 +183,7 @@ def cmd_scan(args) -> int:
 
 
 def main(argv=None) -> int:
-    default_links = str(pathlib.Path(__file__).resolve().parent / "link.txt")
+    default_links = str(VPN_HOME / "link.txt")
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )

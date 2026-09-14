@@ -53,6 +53,15 @@ if [ -z "${HOME:-}" ]; then
 fi
 export HOME
 
+# ── 唯一根目录：~/vpn（与 start_cli.sh 同一套规则）──────────────────
+# 日志统一收在 $VPN_HOME/logs/，根目录只放程序与配置。
+# 必须放在 HOME 兜底之后，否则 HOME 为空时路径会退化成 /vpn。
+VPN_HOME="${VPN_HOME:-$HOME/vpn}"
+LOGS_DIR="$VPN_HOME/logs"
+mkdir -p "$LOGS_DIR" 2>/dev/null || true
+TARGET_SCRIPT="$VPN_HOME/start_cli.sh"
+INSTALL_SCRIPT="$VPN_HOME/install-cron.sh"
+
 # 显式重建 PATH：把两个平台的常见安装位置都放进去。
 # 顺序上 homebrew 在前，这样 `bash`/`python3` 优先拿到 5.x / 3.1x 而不是系统旧版。
 PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
@@ -63,7 +72,7 @@ export PATH
 export PYTHONIOENCODING="${PYTHONIOENCODING:-utf-8}"
 export PYTHONDONTWRITEBYTECODE="${PYTHONDONTWRITEBYTECODE:-1}"
 
-CRON_LOG="$SCRIPT_DIR/cron.log"
+CRON_LOG="$LOGS_DIR/cron.log"
 CRON_LOG_MAX_BYTES="${CRON_LOG_MAX_BYTES:-524288}"   # 单份日志 512KB 后轮换
 HEALTH_KEEP_LINES="${HEALTH_KEEP_LINES:-20000}"      # health.log 最多保留约 13 天
 CRON_BEGIN="# >>> vpn-cron >>>"
@@ -136,7 +145,7 @@ rotate_log() {
 # health.log 只保留最近 N 行：排序窗口是 24h，留 13 天余量足够，
 # 同时把文件稳定压在几百 KB，不会随年增长。
 prune_health() {
-  _f="$SCRIPT_DIR/health.log"
+  _f="$LOGS_DIR/health.log"
   [ -f "$_f" ] || return 0
   _n="$(wc -l < "$_f" 2>/dev/null | tr -d ' ')"
   [ -n "$_n" ] || return 0
@@ -155,8 +164,8 @@ run_heal() {
     log_line "$(date '+%Y-%m-%d %H:%M:%S')  ✗ 找不到可用的 bash，无法执行"
     return 1
   fi
-  if [ ! -f "$SCRIPT_DIR/start_cli.sh" ]; then
-    log_line "$(date '+%Y-%m-%d %H:%M:%S')  ✗ 找不到 $SCRIPT_DIR/start_cli.sh"
+  if [ ! -f "$TARGET_SCRIPT" ]; then
+    log_line "$(date '+%Y-%m-%d %H:%M:%S')  ✗ 找不到 $TARGET_SCRIPT"
     return 1
   fi
   if [ -z "$PY_BIN" ]; then
@@ -166,12 +175,12 @@ run_heal() {
 
   _start="$(date '+%s')"
   _out="$(
-    cd "$SCRIPT_DIR" || exit 1
+    cd "$VPN_HOME" || exit 1
     # PYTHON_BIN 显式传给 start_cli.sh：它内部所有子进程都用这个绝对路径
     PYTHON_BIN="$PY_BIN" \
     NODE_STABLE_ROUNDS="${NODE_STABLE_ROUNDS:-2}" \
     MAX_HEAL_SECONDS="${MAX_HEAL_SECONDS:-180}" \
-    "$BASH_BIN" "$SCRIPT_DIR/start_cli.sh" auto-heal 2>&1
+    "$BASH_BIN" "$TARGET_SCRIPT" auto-heal 2>&1
   )"
   _rc=$?
   _elapsed=$(( $(date '+%s') - _start ))
@@ -207,7 +216,12 @@ doctor() {
 
   echo "=== cron 包装器 ==="
   echo "  脚本        $SCRIPT_PATH"
-  echo "  项目目录    $SCRIPT_DIR"
+  echo "  系统根目录  $VPN_HOME"
+  if [ "$SCRIPT_DIR" != "$VPN_HOME" ]; then
+    echo "  脚本位置    ! 脚本在 ${SCRIPT_DIR}，与根目录不一致"
+    echo "              本工具只认 $VPN_HOME 这一个路径"
+  fi
+  echo "  日志目录    $LOGS_DIR"
   echo "  系统        $(uname -s) $(uname -m)"
   echo "  PATH        $PATH"
   echo "  bash        ${BASH_BIN:-✗ 未找到}"
@@ -215,14 +229,16 @@ doctor() {
   echo "  python      ${PY_BIN:-✗ 未找到}"
   [ -n "$PY_BIN" ] && echo "  python 版本 $("$PY_BIN" -V 2>&1)"
   echo "  cron.log    $( _lines_of "$CRON_LOG" ) 行  ($CRON_LOG)"
-  echo "  health.log  $( _lines_of "$SCRIPT_DIR/health.log" ) 行"
+  echo "  health.log  $( _lines_of "$LOGS_DIR/health.log" ) 行"
+  echo "  vpn.log     $( _lines_of "$LOGS_DIR/vpn.log" ) 行"
+  echo "  xray.log    $( _lines_of "$LOGS_DIR/xray.log" ) 行"
 
   echo
   echo "=== crontab 托管段 ==="
   if crontab -l 2>/dev/null | grep -q "vpn-cron"; then
     crontab -l 2>/dev/null | sed -n "/$(echo "$CRON_BEGIN" | sed 's/[][\\.*^$]/\\&/g')/,/$(echo "$CRON_END" | sed 's/[][\\.*^$]/\\&/g')/p" | sed 's/^/  /'
   else
-    echo "  ✗ 未安装。执行：sh \"$SCRIPT_DIR/install-cron.sh\""
+    echo "  ✗ 未安装。执行：sh \"$INSTALL_SCRIPT\""
   fi
 
   echo
@@ -251,7 +267,7 @@ doctor() {
   echo
   echo "=== 交给 start_cli.sh 自检 ==="
   if [ -n "$BASH_BIN" ]; then
-    PYTHON_BIN="$PY_BIN" "$BASH_BIN" "$SCRIPT_DIR/start_cli.sh" doctor
+    PYTHON_BIN="$PY_BIN" "$BASH_BIN" "$TARGET_SCRIPT" doctor
   fi
   return 0
 }
@@ -264,14 +280,15 @@ usage() {
   vpn-cron.sh -h           本帮助
 
 安装到 crontab:
-  sh "$SCRIPT_DIR/install-cron.sh"            # 每分钟一次
-  sh "$SCRIPT_DIR/install-cron.sh" --remove   # 卸载
+  sh "$INSTALL_SCRIPT"            # 每分钟一次
+  sh "$INSTALL_SCRIPT" --remove   # 卸载
 
 可用环境变量（cron 不继承 shell 环境，需要就写进 crontab 的环境行）:
   VPN_PYTHON=/abs/path/python3     指定解释器（默认自动查找 3.9+）
   VPN_BASH=/abs/path/bash          指定 bash
   NODE_STABLE_ROUNDS=2             录用节点前连测几轮
   MAX_HEAL_SECONDS=180             单次自愈时长上限
+  VPN_HOME=$HOME/vpn               固定根目录（日志在其下的 logs/）
   CRON_LOG_MAX_BYTES=524288        cron.log 轮换阈值
   HEALTH_KEEP_LINES=20000          health.log 保留行数上限
 EOF

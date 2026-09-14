@@ -21,7 +21,12 @@
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
-WRAPPER="$SCRIPT_DIR/vpn-cron.sh"
+
+# ── 唯一根目录：~/vpn（与 start_cli.sh / vpn-cron.sh 同一套规则）──────
+VPN_HOME="${VPN_HOME:-$HOME/vpn}"
+LOGS_DIR="$VPN_HOME/logs"
+mkdir -p "$LOGS_DIR" 2>/dev/null || true
+WRAPPER="$VPN_HOME/vpn-cron.sh"
 CRON_BEGIN="# >>> vpn-cron >>>"
 CRON_END="# <<< vpn-cron <<<"
 
@@ -149,7 +154,7 @@ fi
 
 # 备份原 crontab（仅当非空）
 if [ -s "$TMP_IN" ]; then
-  BACKUP="$SCRIPT_DIR/crontab.backup.$(date '+%Y%m%d%H%M%S')"
+  BACKUP="$VPN_HOME/crontab.backup.$(date '+%Y%m%d%H%M%S')"
   cp "$TMP_IN" "$BACKUP"
   echo "原 crontab 已备份：$BACKUP"
 fi
@@ -195,9 +200,9 @@ case "$(uname -s)" in
     echo "    · cron 默认已启用；增删自己的 crontab 不需要 sudo。"
     echo "    · 只有当本目录位于桌面/文稿/下载等受保护位置时，才需要给"
     echo "      /usr/sbin/cron 授予「完全磁盘访问权限」。"
-    case "$SCRIPT_DIR" in
+    case "$VPN_HOME" in
       "$HOME"/Desktop/*|"$HOME"/Documents/*|"$HOME"/Downloads/*)
-        echo "    · ⚠ 本目录正好在受保护位置：$SCRIPT_DIR"
+        echo "    · ⚠ 本目录正好在受保护位置：$VPN_HOME"
         echo "      打开「系统设置 → 隐私与安全性 → 完全磁盘访问权限」，"
         echo "      添加 /usr/sbin/cron 并勾选，否则任务会静默失败。" ;;
       *) echo "    · 本目录不在受保护位置，无需额外授权。" ;;
@@ -216,4 +221,5 @@ esac
 echo
 echo "  下一步："
 echo "    sh \"$WRAPPER\" doctor      # 自检"
-echo "    tail -f \"$SCRIPT_DIR/cron.log\"   # 观察运行情况"
+echo "    tail -f \"$LOGS_DIR/cron.log\"      # 运行日志"
+echo "    tail -f \"$LOGS_DIR/vpn.log\"       # 启动/换节点/自愈明细"

@@ -29,7 +29,49 @@ bash start_cli.sh doctor
 bash stop_cli.sh
 ```
 
-无需 `chmod +x`、无需下载二进制。项目目录**必须**是 `~/vpn`（`start_cli.sh` 默认从 `~/vpn/link.txt` 读节点，可用 `LINK_FILE` 覆盖）。
+无需 `chmod +x`、无需下载二进制。项目目录**必须**是 `~/vpn`。
+
+---
+
+## 路径与日志
+
+### 只有一个根目录：`~/vpn`
+
+macOS 与 Linux 用的是**同一套规则** —— 固定在**家目录下的 `vpn`**：
+
+| 平台 | 实际路径 |
+| --- | --- |
+| macOS | `/Users/<用户名>/vpn` |
+| Linux | `/home/<用户名>/vpn` |
+
+家目录在两个平台上本来就不同，所以「固定」= 固定成 `$HOME/vpn`，而不是写死绝对路径字符串（写死 `/Users/...` 到 Linux 上必然失效）。
+
+脚本内部只有一个变量 `VPN_HOME="${VPN_HOME:-$HOME/vpn}"`，**其余所有路径都由它推导**，不存在第二个根。需要临时换位置（测试、迁移）时：
+
+```bash
+VPN_HOME=/path/to/vpn bash start_cli.sh doctor
+```
+
+`doctor` 会检查「脚本所在目录」和 `VPN_HOME` 是否一致，不一致时明确提示 —— 因为二进制、geo 数据、`link.txt` 都按 `VPN_HOME` 找。
+
+### 所有日志都在 `logs/` 下
+
+根目录只放程序、配置与节点文件，日志**一律**落在 `$VPN_HOME/logs/`：
+
+| 文件 | 内容 | 大小 |
+| --- | --- | --- |
+| `logs/vpn.log` | **操作流水**：启动 / 换节点 / 自愈 / 代理开关。`start_cli.sh`、`stop_cli.sh` 共用一份 | 每次动作几行 |
+| `logs/health.log` | 每分钟一条 `<ISO8601> <1\|0> <link.txt 行号>` 采样 | 自动修剪到 20000 行 |
+| `logs/cron.log` | cron 包装器运行日志，UP 每分钟一行、异常展开明细 | 512KB 后轮换为 `.1` |
+| `logs/xray.log` | xray 进程自身的 stdout/stderr，每次启动覆盖 | 小 |
+
+```bash
+tail -f logs/vpn.log      # 看「刚才为什么换节点」
+tail -f logs/cron.log     # 看「每分钟有没有在跑」
+bash start_cli.sh health  # 看可用率报告（读 logs/health.log）
+```
+
+`logs/` 整个目录都在 `.gitignore` 里（只保留一个 `.gitkeep` 占位），日志不会进仓库。
 
 ---
 
@@ -58,7 +100,8 @@ MAILTO=""
 
 ```bash
 sh vpn-cron.sh doctor        # PATH / bash / python / crontab / cron 服务 / 运行状态
-tail -f cron.log             # 每分钟一行 run: UP；异常时才展开详细输出
+tail -f logs/cron.log        # 每分钟一行 run: UP；异常时才展开详细输出
+tail -f logs/vpn.log         # 操作明细：启动 / 换节点 / 自愈
 ```
 
 ### 为什么要多一层 vpn-cron.sh
@@ -73,7 +116,7 @@ cron 的运行环境和你的交互 shell 完全是两回事，实测踩到的�
 | locale 可能是 `C`/`POSIX` | Python 往管道写中文 `UnicodeEncodeError` | 导出 `PYTHONIOENCODING=utf-8` |
 | 任务可能重叠触发 | 上一轮还在换节点，下一轮又来了 | `start_cli.sh` 用 `mkdir` 原子锁 + 残留锁自动回收 |
 | stdout 有输出就发邮件 | 邮箱被刷屏 | 包装器自己写日志，并把 `MAILTO=""` 写进 crontab |
-| 日志无限增长 | `health.log` 每年涨 15MB | `cron.log` 512KB 轮换、`health.log` 保留最近 20000 行 |
+| 日志无限增长 | `logs/health.log` 每年涨 15MB | `logs/cron.log` 512KB 轮换、`logs/health.log` 保留最近 20000 行 |
 
 ### 跨平台踩过的坑（都已规避）
 
@@ -184,7 +227,7 @@ cron 不继承 shell 环境，要改这些值就写进 crontab 的环境行（�
 
 ---
 
-## health.log 格式
+## logs/health.log 格式
 
 ```
 <ISO8601 时间戳> <1|0> <link.txt 行号>
@@ -194,11 +237,11 @@ cron 不继承 shell 环境，要改这些值就写进 crontab 的环境行（�
 第 3 列**永远是 link.txt 的原始行号**，与 `--line` 参数、`node_stats.py` 的排名共用同一套编号。
 
 ```bash
-awk '{print $2}' health.log          # 原始 1/0 序列
+awk '{print $2}' logs/health.log     # 原始 1/0 序列
 bash start_cli.sh nodes              # 按节点汇总
 ```
 
-`health.log` 会被包装器自动修剪到最近 20000 行（约 13 天），排序窗口只有 24h，不影响判断。
+`logs/health.log` 会被包装器自动修剪到最近 20000 行（约 13 天），排序窗口只有 24h，不影响判断。
 
 ---
 
@@ -222,7 +265,15 @@ bash start_cli.sh nodes              # 按节点汇总
 **更新 xray** 时替换对应文件并提交即可。注意 git 每个版本都会留一份历史副本（约 +36 MB/次），频繁更新可考虑改挂 Git LFS。
 
 运行时依赖：**Python 3.9+**（`dict[str, ...]` 泛型注解）、`bash`（已兼容 3.2）、`curl`。
-`xray` 二进制的查找顺序是 `XRAY_BIN_OVERRIDE` 环境变量 → `xray-<os>-<arch>` → `xray`。
+`xray` 二进制的查找顺序是 `XRAY_BIN_OVERRIDE` 环境变量 → `$VPN_HOME/xray-<os>-<arch>` → `$VPN_HOME/xray`。
+
+路径相关环境变量：
+
+| 变量 | 默认 | 作用 |
+| --- | --- | --- |
+| `VPN_HOME` | `$HOME/vpn` | **唯一根目录**，日志在其 `logs/` 下 |
+| `LINK_FILE` | `$VPN_HOME/link.txt` | 节点列表位置 |
+| `XRAY_BIN_OVERRIDE` | 空 | 指定 xray 二进制路径 |
 
 ---
 
@@ -246,8 +297,11 @@ Xray-linux-64.zip       上游原始 release 包（留档）
 .gitattributes          二进制保护 + 脚本统一 LF
 config.json             运行时生成，每次启动覆盖
 selected_node.txt       运行时生成，记录当前节点（node_id = link.txt 行号）
-health.log              采样日志，append-only
-cron.log                cron 运行日志，静默 UP 每分钟一行
+logs/                   全部日志目录（整目录被 gitignore）
+logs/vpn.log            操作流水：启动 / 换节点 / 自愈 / 代理开关
+logs/health.log         每分钟 1/0 采样，append-only，自动修剪
+logs/cron.log           cron 运行日志，静默 UP 每分钟一行（轮换为 .1）
+logs/xray.log           xray 进程自身的输出，每次启动覆盖
 proxy.env               Linux 下生成，source 后当前 shell 可用代理
 ```
 
@@ -255,7 +309,7 @@ proxy.env               Linux 下生成，source 后当前 shell 可用代理
 
 ## 注意
 
-`link.txt`、`config.json`、`selected_node.txt` 含节点凭据。本仓库是公开的，**不要把 `.env`、工作日志或任何 API Key 一起提交**（`.gitignore` 已挡住 `/.env`、`/.workbuddy/`、`*.log`、`crontab.backup.*`、`proxy.env`）。
+`link.txt`、`config.json`、`selected_node.txt` 含节点凭据。本仓库是公开的，**不要把 `.env`、工作日志或任何 API Key 一起提交**（`.gitignore` 已挡住 `/.env`、`/.workbuddy/`、`logs/`、`*.log`、`crontab.backup.*`、`proxy.env`）。
 
 `xray`、`xray-linux-64`、`geoip.dat`、`geosite.dat` **是故意入库的**，为的是 clone 后开箱可用；它们来自 XTLS/Xray-core 的公开 release（MIT/Apache-2.0 系），不含任何隐私。新增忽略规则后建议用 `git check-ignore -v <file>` 逐个验证 —— `.gitignore` 里 `#` 只有**行首**才是注释，写在模式行尾会让整条规则静默失效。
 

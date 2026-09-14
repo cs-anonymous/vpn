@@ -11,11 +11,12 @@ xray.pid
 nodes.json
 .start_cli.lock/
 
-# ── 日志 ─────────────────────────────────────────────────
+# ── 日志：全部集中在 logs/，整目录忽略（用 .gitkeep 占位）──
+# 包含 health.log（含节点行号）、vpn.log（操作流水）、xray.log、cron.log
+# 以及轮换产物 cron.log.1
+logs/*
+!logs/.gitkeep
 *.log
-health.log*
-xray.log*
-cron.log*
 
 # ── 定时任务产物 ─────────────────────────────────────────
 # vpn-cron.sh 写日志（cron.log），install-cron.sh 备份原 crontab，
